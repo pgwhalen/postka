@@ -9,6 +9,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Timestamp;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -177,7 +178,7 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
         List<ConsumerRecord<K, V>> records = new ArrayList<>();
         try (PreparedStatement ps = conn.prepareStatement(
                 """
-                SELECT offset_id, timestamp_ms, key_bytes, value_bytes, headers
+                SELECT offset_id, record_timestamp, key_bytes, value_bytes, headers
                 FROM postka_records
                 WHERE topic_name = ? AND partition_id = ? AND offset_id >= ?
                 ORDER BY offset_id
@@ -190,7 +191,8 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     long offset = rs.getLong("offset_id");
-                    long timestamp = rs.getLong("timestamp_ms");
+                    Timestamp ts = rs.getTimestamp("record_timestamp");
+                    long timestamp = ts != null ? ts.getTime() : 0L;
                     byte[] keyBytes = rs.getBytes("key_bytes");
                     byte[] valueBytes = rs.getBytes("value_bytes");
 
@@ -248,7 +250,7 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT (group_id, topic_name, partition_id)
                 DO UPDATE SET committed_offset = EXCLUDED.committed_offset,
-                              committed_at = CURRENT_TIMESTAMP
+                              committed_at = (NOW() AT TIME ZONE 'UTC')
                 """)) {
             ps.setString(1, groupId);
             ps.setString(2, tp.topic());

@@ -9,6 +9,8 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -128,7 +130,7 @@ public class PostkaProducer<K, V> implements AutoCloseable {
                 try (PreparedStatement ps = conn.prepareStatement(
                         """
                         INSERT INTO postka_records
-                            (topic_name, partition_id, offset_id, timestamp_ms, key_bytes, value_bytes, headers)
+                            (topic_name, partition_id, offset_id, record_timestamp, key_bytes, value_bytes, headers)
                         VALUES (?, ?, postka_next_offset(?, ?), ?, ?, ?, ?::jsonb)
                         RETURNING offset_id
                         """)) {
@@ -136,7 +138,7 @@ public class PostkaProducer<K, V> implements AutoCloseable {
                     ps.setInt(2, partition);
                     ps.setString(3, record.topic());
                     ps.setInt(4, partition);
-                    ps.setLong(5, timestamp);
+                    ps.setTimestamp(5, Timestamp.from(Instant.ofEpochMilli(timestamp)));
                     ps.setBytes(6, keyBytes);
                     ps.setBytes(7, valueBytes);
                     ps.setString(8, "[]"); // TODO: serialize headers

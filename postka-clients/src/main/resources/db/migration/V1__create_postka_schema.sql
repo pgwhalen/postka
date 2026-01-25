@@ -1,11 +1,14 @@
 -- Postka Schema: PostgreSQL-backed Kafka replacement
 -- This migration creates the core tables and functions needed for Postka
 
+-- Enum for timestamp type (matches Kafka's TimestampType)
+CREATE TYPE postka_timestamp_type AS ENUM ('CREATE_TIME', 'LOG_APPEND_TIME');
+
 -- Topics metadata table
 CREATE TABLE postka_topics (
     topic_name TEXT PRIMARY KEY,
     partition_count INTEGER NOT NULL DEFAULT 1,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC')
 );
 
 -- Partitions within topics
@@ -21,12 +24,12 @@ CREATE TABLE postka_records (
     topic_name TEXT NOT NULL,
     partition_id INTEGER NOT NULL,
     offset_id BIGINT NOT NULL,
-    timestamp_ms BIGINT NOT NULL,
-    timestamp_type VARCHAR(20) NOT NULL DEFAULT 'CREATE_TIME',
+    record_timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    timestamp_type postka_timestamp_type NOT NULL DEFAULT 'CREATE_TIME',
     key_bytes BYTEA,
     value_bytes BYTEA,
     headers JSONB DEFAULT '[]'::jsonb,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC'),
     UNIQUE (topic_name, partition_id, offset_id),
     FOREIGN KEY (topic_name, partition_id) REFERENCES postka_partitions(topic_name, partition_id)
 );
@@ -42,7 +45,7 @@ CREATE TABLE postka_consumer_offsets (
     partition_id INTEGER NOT NULL,
     committed_offset BIGINT NOT NULL,
     metadata TEXT,
-    committed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    committed_at TIMESTAMP WITH TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC'),
     PRIMARY KEY (group_id, topic_name, partition_id),
     FOREIGN KEY (topic_name, partition_id) REFERENCES postka_partitions(topic_name, partition_id)
 );
