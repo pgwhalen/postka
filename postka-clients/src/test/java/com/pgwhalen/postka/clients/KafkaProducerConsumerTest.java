@@ -18,6 +18,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -68,6 +69,16 @@ public class KafkaProducerConsumerTest
     @Override
     protected Future<?> send(KafkaProducer<String, String> producer, String topic, String key, String value) {
         return producer.send(new ProducerRecord<>(topic, key, value));
+    }
+
+    @Override
+    protected Future<?> sendWithHeaders(KafkaProducer<String, String> producer, String topic,
+                                         String key, String value, Map<String, byte[]> headers) {
+        ProducerRecord<String, String> record = new ProducerRecord<>(topic, key, value);
+        for (Map.Entry<String, byte[]> header : headers.entrySet()) {
+            record.headers().add(header.getKey(), header.getValue());
+        }
+        return producer.send(record);
     }
 
     @Override

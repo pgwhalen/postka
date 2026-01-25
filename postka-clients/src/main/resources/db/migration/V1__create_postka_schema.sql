@@ -4,6 +4,12 @@
 -- Enum for timestamp type (matches Kafka's TimestampType)
 CREATE TYPE postka_timestamp_type AS ENUM ('CREATE_TIME', 'LOG_APPEND_TIME');
 
+-- Composite type for record headers (key-value pairs where key is text and value is binary)
+CREATE TYPE postka_header AS (
+    key TEXT,
+    value BYTEA
+);
+
 -- Topics metadata table
 CREATE TABLE postka_topics (
     topic_name TEXT PRIMARY KEY,
@@ -28,7 +34,7 @@ CREATE TABLE postka_records (
     timestamp_type postka_timestamp_type NOT NULL DEFAULT 'CREATE_TIME',
     key_bytes BYTEA,
     value_bytes BYTEA,
-    headers JSONB DEFAULT '[]'::jsonb,
+    headers postka_header[] DEFAULT ARRAY[]::postka_header[],
     created_at TIMESTAMP WITH TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC'),
     UNIQUE (topic_name, partition_id, offset_id),
     FOREIGN KEY (topic_name, partition_id) REFERENCES postka_partitions(topic_name, partition_id)

@@ -1,10 +1,13 @@
 package com.pgwhalen.postka.clients.consumer;
 
 import com.pgwhalen.postka.common.TopicPartition;
+import com.pgwhalen.postka.common.header.Header;
+import com.pgwhalen.postka.common.header.RecordHeader;
 import com.pgwhalen.postka.common.header.RecordHeaders;
 import com.pgwhalen.postka.common.serialization.Deserializer;
 
 import javax.sql.DataSource;
+import java.sql.Array;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -195,6 +198,7 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
                     long timestamp = ts != null ? ts.getTime() : 0L;
                     byte[] keyBytes = rs.getBytes("key_bytes");
                     byte[] valueBytes = rs.getBytes("value_bytes");
+                    RecordHeaders headers = parseHeaders(rs.getArray("headers"));
 
                     K key = keyDeserializer != null ?
                             keyDeserializer.deserialize(tp.topic(), keyBytes) : null;
@@ -205,12 +209,92 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
                             tp.topic(), tp.partition(), offset, timestamp,
                             keyBytes != null ? keyBytes.length : -1,
                             valueBytes != null ? valueBytes.length : -1,
-                            key, value, new RecordHeaders()
+                            key, value, headers
                     ));
                 }
             }
         }
         return records;
+    }
+
+    private RecordHeaders parseHeaders(Array headersArray) throws SQLException {
+        List<Header> headers = new ArrayList<>();
+        if (headersArray != null) {
+            Object[] array = (Object[]) headersArray.getArray();
+            for (Object element : array) {
+                if (element instanceof org.postgresql.util.PGobject pgObject) {
+                    String value = pgObject.getValue();
+                    if (value != null && value.startsWith("(") && value.endsWith(")")) {
+                        String[] parts = parseCompositeValue(value.substring(1, value.length() - 1));
+                        if (parts.length == 2) {
+                            String key = unescapeCompositeField(parts[0]);
+                            byte[] valueBytes = parseByteaHex(parts[1]);
+                            headers.add(new RecordHeader(key, valueBytes));
+                        }
+                    }
+                }
+            }
+        }
+        return new RecordHeaders(headers);
+    }
+
+    private String[] parseCompositeValue(String value) {
+        List<String> parts = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean inQuotes = false;
+        boolean escaped = false;
+
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (escaped) {
+                current.append(c);
+                escaped = false;
+            } else if (c == '\\') {
+                current.append(c);
+                escaped = true;
+            } else if (c == '"') {
+                inQuotes = !inQuotes;
+            } else if (c == ',' && !inQuotes) {
+                parts.add(current.toString());
+                current = new StringBuilder();
+            } else {
+                current.append(c);
+            }
+        }
+        parts.add(current.toString());
+        return parts.toArray(new String[0]);
+    }
+
+    private String unescapeCompositeField(String field) {
+        if (field == null || field.isEmpty()) {
+            return field;
+        }
+        if (field.startsWith("\"") && field.endsWith("\"")) {
+            field = field.substring(1, field.length() - 1);
+        }
+        return field.replace("\\\"", "\"").replace("\\\\", "\\");
+    }
+
+    private byte[] parseByteaHex(String hex) {
+        if (hex == null || hex.isEmpty()) {
+            return null;
+        }
+        String hexPart = hex;
+        if (hexPart.startsWith("\"") && hexPart.endsWith("\"")) {
+            hexPart = hexPart.substring(1, hexPart.length() - 1);
+        }
+        if (hexPart.startsWith("\\\\x")) {
+            hexPart = hexPart.substring(3);
+        } else if (hexPart.startsWith("\\x")) {
+            hexPart = hexPart.substring(2);
+        } else {
+            return null;
+        }
+        byte[] result = new byte[hexPart.length() / 2];
+        for (int i = 0; i < result.length; i++) {
+            result[i] = (byte) Integer.parseInt(hexPart.substring(i * 2, i * 2 + 2), 16);
+        }
+        return result;
     }
 
     /**

@@ -3,10 +3,12 @@ package com.pgwhalen.postka.clients;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
@@ -39,15 +41,27 @@ public abstract class AbstractProducerConsumerTest<P, C> {
 
     protected abstract String uniqueTopic();
 
-    protected record TestRecord(String topic, int partition, long offset, String key, String value) {
+    protected abstract Future<?> sendWithHeaders(P producer, String topic, String key, String value,
+                                                  Map<String, byte[]> headers);
+
+    protected record TestRecord(String topic, int partition, long offset, String key, String value,
+                                Map<String, byte[]> headers) {
         static TestRecord fromKafkaRecord(ConsumerRecord<String, String> record) {
+            Map<String, byte[]> headers = new java.util.HashMap<>();
+            for (org.apache.kafka.common.header.Header header : record.headers()) {
+                headers.put(header.key(), header.value());
+            }
             return new TestRecord(record.topic(), record.partition(),
-                    record.offset(), record.key(), record.value());
+                    record.offset(), record.key(), record.value(), headers);
         }
 
         static TestRecord fromPostkaRecord(com.pgwhalen.postka.clients.consumer.ConsumerRecord<String, String> record) {
+            Map<String, byte[]> headers = new java.util.HashMap<>();
+            for (com.pgwhalen.postka.common.header.Header header : record.headers()) {
+                headers.put(header.key(), header.value());
+            }
             return new TestRecord(record.topic(), record.partition(),
-                    record.offset(), record.key(), record.value());
+                    record.offset(), record.key(), record.value(), headers);
         }
     }
 
@@ -151,6 +165,50 @@ public abstract class AbstractProducerConsumerTest<P, C> {
             closeConsumer(consumer2);
         } finally {
             closeProducer(producer);
+        }
+    }
+
+    @Test
+    void testRecordHeaders() throws Exception {
+        String topic = uniqueTopic();
+        P producer = createProducer();
+        C consumer = createConsumer("test-group-headers-" + System.currentTimeMillis());
+
+        try {
+            // Send a message with headers
+            Map<String, byte[]> sentHeaders = Map.of(
+                    "header1", "value1".getBytes(StandardCharsets.UTF_8),
+                    "header2", new byte[]{1, 2, 3, 4, 5}
+            );
+            Future<?> future = sendWithHeaders(producer, topic, "key1", "value1", sentHeaders);
+            future.get(10, TimeUnit.SECONDS);
+
+            // Subscribe and poll
+            subscribe(consumer, List.of(topic));
+
+            List<TestRecord> records = new ArrayList<>();
+            long deadline = System.currentTimeMillis() + 10_000;
+            while (records.isEmpty() && System.currentTimeMillis() < deadline) {
+                records.addAll(poll(consumer, Duration.ofMillis(500)));
+            }
+
+            // Verify record was received
+            assertFalse(records.isEmpty(), "Should have received at least one record");
+            TestRecord record = records.getFirst();
+            assertEquals(topic, record.topic());
+            assertEquals("key1", record.key());
+            assertEquals("value1", record.value());
+
+            // Verify headers
+            assertNotNull(record.headers(), "Headers should not be null");
+            assertEquals(2, record.headers().size(), "Should have 2 headers");
+            assertArrayEquals("value1".getBytes(StandardCharsets.UTF_8),
+                    record.headers().get("header1"), "Header1 value should match");
+            assertArrayEquals(new byte[]{1, 2, 3, 4, 5},
+                    record.headers().get("header2"), "Header2 value should match");
+        } finally {
+            closeProducer(producer);
+            closeConsumer(consumer);
         }
     }
 }

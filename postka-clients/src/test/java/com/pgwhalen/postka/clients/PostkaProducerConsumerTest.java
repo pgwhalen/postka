@@ -9,6 +9,7 @@ import com.pgwhalen.postka.clients.consumer.PostkaConsumer;
 import com.pgwhalen.postka.clients.producer.PostkaProducer;
 import com.pgwhalen.postka.clients.producer.ProducerConfig;
 import com.pgwhalen.postka.clients.producer.ProducerRecord;
+import com.pgwhalen.postka.common.header.RecordHeader;
 import com.pgwhalen.postka.common.serialization.StringDeserializer;
 import com.pgwhalen.postka.common.serialization.StringSerializer;
 import org.flywaydb.core.Flyway;
@@ -84,6 +85,16 @@ public class PostkaProducerConsumerTest
     @Override
     protected Future<?> send(PostkaProducer<String, String> producer, String topic, String key, String value) {
         return producer.send(new ProducerRecord<>(topic, key, value));
+    }
+
+    @Override
+    protected Future<?> sendWithHeaders(PostkaProducer<String, String> producer, String topic,
+                                         String key, String value, Map<String, byte[]> headers) {
+        List<com.pgwhalen.postka.common.header.Header> headerList = new ArrayList<>();
+        for (Map.Entry<String, byte[]> header : headers.entrySet()) {
+            headerList.add(new RecordHeader(header.getKey(), header.getValue()));
+        }
+        return producer.send(new ProducerRecord<>(topic, null, null, key, value, headerList));
     }
 
     @Override

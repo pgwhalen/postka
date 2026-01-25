@@ -2,9 +2,13 @@ package com.pgwhalen.postka.clients.producer;
 
 import com.pgwhalen.postka.common.PartitionInfo;
 import com.pgwhalen.postka.common.TopicPartition;
+import com.pgwhalen.postka.common.header.Header;
 import com.pgwhalen.postka.common.serialization.Serializer;
 
+import org.postgresql.util.PGobject;
+
 import javax.sql.DataSource;
+import java.sql.Array;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -131,7 +135,7 @@ public class PostkaProducer<K, V> implements AutoCloseable {
                         """
                         INSERT INTO postka_records
                             (topic_name, partition_id, offset_id, record_timestamp, key_bytes, value_bytes, headers)
-                        VALUES (?, ?, postka_next_offset(?, ?), ?, ?, ?, ?::jsonb)
+                        VALUES (?, ?, postka_next_offset(?, ?), ?, ?, ?, ?)
                         RETURNING offset_id
                         """)) {
                     ps.setString(1, record.topic());
@@ -141,7 +145,7 @@ public class PostkaProducer<K, V> implements AutoCloseable {
                     ps.setTimestamp(5, Timestamp.from(Instant.ofEpochMilli(timestamp)));
                     ps.setBytes(6, keyBytes);
                     ps.setBytes(7, valueBytes);
-                    ps.setString(8, "[]"); // TODO: serialize headers
+                    ps.setArray(8, createHeadersArray(conn, record.headers()));
 
                     try (ResultSet rs = ps.executeQuery()) {
                         rs.next();
@@ -172,6 +176,49 @@ public class PostkaProducer<K, V> implements AutoCloseable {
     public void flush() {
         // For hello world, sends are synchronous via executor
         // A full implementation would batch and flush pending writes
+    }
+
+    private Array createHeadersArray(Connection conn, Iterable<Header> headers) throws SQLException {
+        List<PGobject> headerObjects = new ArrayList<>();
+        if (headers != null) {
+            for (Header header : headers) {
+                PGobject obj = new PGobject();
+                obj.setType("postka_header");
+                // Composite type text format: (key,"\\x<hex>")
+                // BYTEA must be hex-encoded in composite type text representation
+                obj.setValue(formatCompositeHeader(header.key(), header.value()));
+                headerObjects.add(obj);
+            }
+        }
+        return conn.createArrayOf("postka_header", headerObjects.toArray());
+    }
+
+    private String formatCompositeHeader(String key, byte[] value) {
+        StringBuilder sb = new StringBuilder("(");
+        // Escape the key for composite text format
+        sb.append(escapeCompositeField(key));
+        sb.append(",");
+        // Format bytea as hex for composite text format
+        if (value != null) {
+            sb.append("\"\\\\x");
+            for (byte b : value) {
+                sb.append(String.format("%02x", b));
+            }
+            sb.append("\"");
+        }
+        sb.append(")");
+        return sb.toString();
+    }
+
+    private static String escapeCompositeField(String s) {
+        if (s == null) {
+            return "";
+        }
+        // If field contains special characters, quote it and escape internal quotes/backslashes
+        if (s.contains(",") || s.contains("(") || s.contains(")") || s.contains("\"") || s.contains("\\")) {
+            return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+        }
+        return s;
     }
 
     /**
