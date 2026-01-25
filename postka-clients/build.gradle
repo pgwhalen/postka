@@ -1,0 +1,30 @@
+plugins {
+    id 'java-library'
+}
+
+dependencies {
+    // Core dependencies
+    api "org.slf4j:slf4j-api:${slf4jVersion}"
+    implementation "org.postgresql:postgresql:${postgresDriverVersion}"
+    implementation "com.zaxxer:HikariCP:${hikariVersion}"
+    implementation "org.flywaydb:flyway-core:${flywayVersion}"
+    implementation "org.flywaydb:flyway-database-postgresql:${flywayVersion}"
+
+    // Test dependencies
+    testImplementation platform("org.junit:junit-bom:${junitVersion}")
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testImplementation "org.testcontainers:testcontainers:${testcontainersVersion}"
+    testImplementation "org.testcontainers:postgresql:${testcontainersVersion}"
+    testImplementation "org.testcontainers:kafka:${testcontainersVersion}"
+    testImplementation "org.testcontainers:junit-jupiter:${testcontainersVersion}"
+    testImplementation "org.apache.kafka:kafka-clients:${kafkaClientsVersion}"
+    testRuntimeOnly "ch.qos.logback:logback-classic:${logbackVersion}"
+}
+
+test {
+    useJUnitPlatform()
+    // Pass Docker environment to test JVM for TestContainers
+    def dockerSocket = System.getenv('DOCKER_HOST') ?: "unix://${System.getProperty('user.home')}/.docker/run/docker.sock"
+    environment 'DOCKER_HOST', dockerSocket
+    environment 'TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE', "${System.getProperty('user.home')}/.docker/run/docker.sock"
+}
