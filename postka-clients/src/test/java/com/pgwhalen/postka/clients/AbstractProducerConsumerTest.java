@@ -1,5 +1,6 @@
 package com.pgwhalen.postka.clients;
 
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
@@ -39,6 +40,15 @@ public abstract class AbstractProducerConsumerTest<P, C> {
     protected abstract String uniqueTopic();
 
     protected record TestRecord(String topic, int partition, long offset, String key, String value) {
+        static TestRecord fromKafkaRecord(ConsumerRecord<String, String> record) {
+            return new TestRecord(record.topic(), record.partition(),
+                    record.offset(), record.key(), record.value());
+        }
+
+        static TestRecord fromPostkaRecord(com.pgwhalen.postka.clients.consumer.ConsumerRecord<String, String> record) {
+            return new TestRecord(record.topic(), record.partition(),
+                    record.offset(), record.key(), record.value());
+        }
     }
 
     @Test
@@ -63,7 +73,7 @@ public abstract class AbstractProducerConsumerTest<P, C> {
 
             // Verify
             assertFalse(records.isEmpty(), "Should have received at least one record");
-            TestRecord record = records.get(0);
+            TestRecord record = records.getFirst();
             assertEquals(topic, record.topic());
             assertEquals("key1", record.key());
             assertEquals("value1", record.value());

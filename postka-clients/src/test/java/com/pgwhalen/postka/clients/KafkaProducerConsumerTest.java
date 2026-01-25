@@ -75,8 +75,7 @@ public class KafkaProducerConsumerTest
         ConsumerRecords<String, String> records = consumer.poll(timeout);
         List<TestRecord> result = new ArrayList<>();
         for (ConsumerRecord<String, String> record : records) {
-            result.add(new TestRecord(record.topic(), record.partition(),
-                    record.offset(), record.key(), record.value()));
+            result.add(TestRecord.fromKafkaRecord(record));
         }
         return result;
     }

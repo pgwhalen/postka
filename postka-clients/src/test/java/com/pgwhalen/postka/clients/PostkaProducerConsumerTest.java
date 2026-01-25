@@ -34,6 +34,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class PostkaProducerConsumerTest
         extends AbstractProducerConsumerTest<PostkaProducer<String, String>, PostkaConsumer<String, String>> {
 
+    /** @noinspection resource*/
     @Container
     static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16")
             .withDatabaseName("postka_test")
@@ -90,8 +91,7 @@ public class PostkaProducerConsumerTest
         ConsumerRecords<String, String> records = consumer.poll(timeout);
         List<TestRecord> result = new ArrayList<>();
         for (ConsumerRecord<String, String> record : records) {
-            result.add(new TestRecord(record.topic(), record.partition(),
-                    record.offset(), record.key(), record.value()));
+            result.add(TestRecord.fromPostkaRecord(record));
         }
         return result;
     }
