@@ -16,6 +16,12 @@ This file helps Claude (and other AI assistants) understand the Postka project.
 2. **Test-Driven Parity**: Always test against real Kafka first, then implement for Postka
 3. **Correctness Over Performance**: Simple, correct implementations are preferred
 
+## Adding Features
+ - When adding a new feature to Postka, **ALWAYS** at a compatability test to  
+ - When changing the flyway migration to add a new feature, assume the existing migration can be changed rather than
+ creating a new migration.  This is alpha software not running in production, so we don't need to worry about migrating
+ data yet.
+
 ## Build & Test
 
 ```bash
