@@ -44,6 +44,10 @@ public abstract class AbstractProducerConsumerTest<P, C> {
     protected abstract Future<?> sendWithHeaders(P producer, String topic, String key, String value,
                                                   Map<String, byte[]> headers);
 
+    protected abstract Future<?> sendToPartition(P producer, String topic, int partition, String key, String value);
+
+    protected abstract void ensureTopicWithPartitions(String topic, int partitions) throws Exception;
+
     protected record TestRecord(String topic, int partition, long offset, String key, String value,
                                 Map<String, byte[]> headers) {
         static TestRecord fromKafkaRecord(ConsumerRecord<String, String> record) {
@@ -165,6 +169,134 @@ public abstract class AbstractProducerConsumerTest<P, C> {
             closeConsumer(consumer2);
         } finally {
             closeProducer(producer);
+        }
+    }
+
+    @Test
+    void testMultiplePartitions() throws Exception {
+        String topic = uniqueTopic();
+        int numPartitions = 3;
+        ensureTopicWithPartitions(topic, numPartitions);
+
+        P producer = createProducer();
+        C consumer = createConsumer("test-group-partitions-" + System.currentTimeMillis());
+
+        try {
+            // Send messages to different partitions
+            sendToPartition(producer, topic, 0, "key-p0-a", "value-p0-a").get(5, TimeUnit.SECONDS);
+            sendToPartition(producer, topic, 0, "key-p0-b", "value-p0-b").get(5, TimeUnit.SECONDS);
+            sendToPartition(producer, topic, 1, "key-p1-a", "value-p1-a").get(5, TimeUnit.SECONDS);
+            sendToPartition(producer, topic, 2, "key-p2-a", "value-p2-a").get(5, TimeUnit.SECONDS);
+            sendToPartition(producer, topic, 2, "key-p2-b", "value-p2-b").get(5, TimeUnit.SECONDS);
+
+            // Subscribe and poll
+            subscribe(consumer, List.of(topic));
+
+            List<TestRecord> allRecords = new ArrayList<>();
+            long deadline = System.currentTimeMillis() + 15_000;
+            while (allRecords.size() < 5 && System.currentTimeMillis() < deadline) {
+                allRecords.addAll(poll(consumer, Duration.ofMillis(500)));
+            }
+
+            // Verify we got all 5 records
+            assertEquals(5, allRecords.size(), "Should have received 5 records total");
+
+            // Group by partition and verify
+            List<TestRecord> partition0Records = allRecords.stream()
+                    .filter(r -> r.partition() == 0)
+                    .sorted((a, b) -> Long.compare(a.offset(), b.offset()))
+                    .toList();
+            List<TestRecord> partition1Records = allRecords.stream()
+                    .filter(r -> r.partition() == 1)
+                    .sorted((a, b) -> Long.compare(a.offset(), b.offset()))
+                    .toList();
+            List<TestRecord> partition2Records = allRecords.stream()
+                    .filter(r -> r.partition() == 2)
+                    .sorted((a, b) -> Long.compare(a.offset(), b.offset()))
+                    .toList();
+
+            // Verify partition 0 has 2 messages with independent offsets starting at 0
+            assertEquals(2, partition0Records.size(), "Partition 0 should have 2 records");
+            assertEquals(0, partition0Records.get(0).offset(), "First message in partition 0 should have offset 0");
+            assertEquals(1, partition0Records.get(1).offset(), "Second message in partition 0 should have offset 1");
+            assertEquals("key-p0-a", partition0Records.get(0).key());
+            assertEquals("key-p0-b", partition0Records.get(1).key());
+
+            // Verify partition 1 has 1 message with offset 0
+            assertEquals(1, partition1Records.size(), "Partition 1 should have 1 record");
+            assertEquals(0, partition1Records.getFirst().offset(), "First message in partition 1 should have offset 0");
+            assertEquals("key-p1-a", partition1Records.getFirst().key());
+
+            // Verify partition 2 has 2 messages with independent offsets starting at 0
+            assertEquals(2, partition2Records.size(), "Partition 2 should have 2 records");
+            assertEquals(0, partition2Records.get(0).offset(), "First message in partition 2 should have offset 0");
+            assertEquals(1, partition2Records.get(1).offset(), "Second message in partition 2 should have offset 1");
+            assertEquals("key-p2-a", partition2Records.get(0).key());
+            assertEquals("key-p2-b", partition2Records.get(1).key());
+        } finally {
+            closeProducer(producer);
+            closeConsumer(consumer);
+        }
+    }
+
+    @Test
+    void testMultipleTopics() throws Exception {
+        String topic1 = uniqueTopic();
+        String topic2 = uniqueTopic();
+        String topic3 = uniqueTopic();
+        P producer = createProducer();
+        C consumer = createConsumer("test-group-multi-topic-" + System.currentTimeMillis());
+
+        try {
+            // Send messages to different topics
+            send(producer, topic1, "key1-a", "value1-a").get(5, TimeUnit.SECONDS);
+            send(producer, topic1, "key1-b", "value1-b").get(5, TimeUnit.SECONDS);
+            send(producer, topic2, "key2-a", "value2-a").get(5, TimeUnit.SECONDS);
+            send(producer, topic3, "key3-a", "value3-a").get(5, TimeUnit.SECONDS);
+            send(producer, topic3, "key3-b", "value3-b").get(5, TimeUnit.SECONDS);
+            send(producer, topic3, "key3-c", "value3-c").get(5, TimeUnit.SECONDS);
+
+            // Subscribe to all topics
+            subscribe(consumer, List.of(topic1, topic2, topic3));
+
+            List<TestRecord> allRecords = new ArrayList<>();
+            long deadline = System.currentTimeMillis() + 15_000;
+            while (allRecords.size() < 6 && System.currentTimeMillis() < deadline) {
+                allRecords.addAll(poll(consumer, Duration.ofMillis(500)));
+            }
+
+            // Verify we got all 6 records
+            assertEquals(6, allRecords.size(), "Should have received 6 records total");
+
+            // Group by topic and verify
+            List<TestRecord> topic1Records = allRecords.stream()
+                    .filter(r -> r.topic().equals(topic1))
+                    .toList();
+            List<TestRecord> topic2Records = allRecords.stream()
+                    .filter(r -> r.topic().equals(topic2))
+                    .toList();
+            List<TestRecord> topic3Records = allRecords.stream()
+                    .filter(r -> r.topic().equals(topic3))
+                    .toList();
+
+            // Verify topic1 has 2 messages with correct offsets
+            assertEquals(2, topic1Records.size(), "Topic1 should have 2 records");
+            assertTrue(topic1Records.stream().anyMatch(r -> r.offset() == 0 && r.key().equals("key1-a")));
+            assertTrue(topic1Records.stream().anyMatch(r -> r.offset() == 1 && r.key().equals("key1-b")));
+
+            // Verify topic2 has 1 message
+            assertEquals(1, topic2Records.size(), "Topic2 should have 1 record");
+            assertEquals(0, topic2Records.getFirst().offset(), "Topic2 first message should have offset 0");
+            assertEquals("key2-a", topic2Records.getFirst().key());
+
+            // Verify topic3 has 3 messages with correct offsets
+            assertEquals(3, topic3Records.size(), "Topic3 should have 3 records");
+            assertTrue(topic3Records.stream().anyMatch(r -> r.offset() == 0 && r.key().equals("key3-a")));
+            assertTrue(topic3Records.stream().anyMatch(r -> r.offset() == 1 && r.key().equals("key3-b")));
+            assertTrue(topic3Records.stream().anyMatch(r -> r.offset() == 2 && r.key().equals("key3-c")));
+        } finally {
+            closeProducer(producer);
+            closeConsumer(consumer);
         }
     }
 

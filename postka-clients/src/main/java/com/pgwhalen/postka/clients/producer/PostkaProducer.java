@@ -122,30 +122,33 @@ public class PostkaProducer<K, V> implements AutoCloseable {
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
             try {
-                // Ensure topic exists
+                // Ensure topic exists and get the records table name
+                String recordsTableName;
                 try (PreparedStatement ps = conn.prepareStatement(
                         "SELECT postka_ensure_topic(?, 1)")) {
                     ps.setString(1, record.topic());
-                    ps.execute();
+                    try (ResultSet rs = ps.executeQuery()) {
+                        rs.next();
+                        recordsTableName = rs.getString(1);
+                    }
                 }
 
                 // Get next offset and insert record atomically
                 long offset;
-                try (PreparedStatement ps = conn.prepareStatement(
+                String insertSql = String.format(
                         """
-                        INSERT INTO postka_records
-                            (topic_name, partition_id, offset_id, record_timestamp, key_bytes, value_bytes, headers)
-                        VALUES (?, ?, postka_next_offset(?, ?), ?, ?, ?, ?)
+                        INSERT INTO %s
+                            (partition_id, offset_id, record_timestamp, key_bytes, value_bytes, headers)
+                        VALUES (?, postka_next_offset('%s', ?), ?, ?, ?, ?)
                         RETURNING offset_id
-                        """)) {
-                    ps.setString(1, record.topic());
+                        """, recordsTableName, recordsTableName);
+                try (PreparedStatement ps = conn.prepareStatement(insertSql)) {
+                    ps.setInt(1, partition);
                     ps.setInt(2, partition);
-                    ps.setString(3, record.topic());
-                    ps.setInt(4, partition);
-                    ps.setTimestamp(5, Timestamp.from(Instant.ofEpochMilli(timestamp)));
-                    ps.setBytes(6, keyBytes);
-                    ps.setBytes(7, valueBytes);
-                    ps.setArray(8, createHeadersArray(conn, record.headers()));
+                    ps.setTimestamp(3, Timestamp.from(Instant.ofEpochMilli(timestamp)));
+                    ps.setBytes(4, keyBytes);
+                    ps.setBytes(5, valueBytes);
+                    ps.setArray(6, createHeadersArray(conn, record.headers()));
 
                     try (ResultSet rs = ps.executeQuery()) {
                         rs.next();
@@ -230,12 +233,15 @@ public class PostkaProducer<K, V> implements AutoCloseable {
     public List<PartitionInfo> partitionsFor(String topic) {
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(
-                     "SELECT partition_id FROM postka_partitions WHERE topic_name = ? ORDER BY partition_id")) {
+                     "SELECT partition_count FROM postka_topics WHERE topic_name = ?")) {
             ps.setString(1, topic);
             List<PartitionInfo> result = new ArrayList<>();
             try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    result.add(new PartitionInfo(topic, rs.getInt(1), null, null, null));
+                if (rs.next()) {
+                    int partitionCount = rs.getInt(1);
+                    for (int i = 0; i < partitionCount; i++) {
+                        result.add(new PartitionInfo(topic, i, null, null, null));
+                    }
                 }
             }
             return result;

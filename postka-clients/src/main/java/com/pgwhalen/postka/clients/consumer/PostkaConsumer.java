@@ -36,6 +36,7 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
     private final Deserializer<V> valueDeserializer;
     private final Set<String> subscribedTopics = ConcurrentHashMap.newKeySet();
     private final Map<TopicPartition, Long> positions = new ConcurrentHashMap<>();
+    private final Map<String, String> topicTableNames = new ConcurrentHashMap<>();
     private volatile boolean closed = false;
 
     /**
@@ -93,6 +94,7 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
     public void unsubscribe() {
         subscribedTopics.clear();
         positions.clear();
+        topicTableNames.clear();
     }
 
     private void loadCommittedOffsets() {
@@ -150,7 +152,7 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
                     if (!records.isEmpty()) {
                         result.put(tp, records);
                         // Update position to after last record
-                        long lastOffset = records.get(records.size() - 1).offset();
+                        long lastOffset = records.getLast().offset();
                         positions.put(tp, lastOffset + 1);
                     }
                 }
@@ -165,31 +167,60 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
     private List<Integer> getPartitions(Connection conn, String topic) throws SQLException {
         List<Integer> partitions = new ArrayList<>();
         try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT partition_id FROM postka_partitions WHERE topic_name = ? ORDER BY partition_id")) {
+                "SELECT partition_count FROM postka_topics WHERE topic_name = ?")) {
             ps.setString(1, topic);
             try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    partitions.add(rs.getInt(1));
+                if (rs.next()) {
+                    int partitionCount = rs.getInt(1);
+                    for (int i = 0; i < partitionCount; i++) {
+                        partitions.add(i);
+                    }
                 }
             }
         }
         return partitions;
     }
 
+    private String getRecordsTableName(Connection conn, String topic) throws SQLException {
+        String tableName = topicTableNames.get(topic);
+        if (tableName != null) {
+            return tableName;
+        }
+
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT postka_get_records_table(?)")) {
+            ps.setString(1, topic);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    tableName = rs.getString(1);
+                    if (tableName != null) {
+                        topicTableNames.put(topic, tableName);
+                    }
+                }
+            }
+        }
+        return tableName;
+    }
+
     private List<ConsumerRecord<K, V>> fetchRecords(Connection conn, TopicPartition tp,
                                                     long startOffset) throws SQLException {
+        String tableName = getRecordsTableName(conn, tp.topic());
+        if (tableName == null) {
+            return new ArrayList<>();
+        }
+
         List<ConsumerRecord<K, V>> records = new ArrayList<>();
-        try (PreparedStatement ps = conn.prepareStatement(
+        String sql = String.format(
                 """
                 SELECT offset_id, record_timestamp, key_bytes, value_bytes, headers
-                FROM postka_records
-                WHERE topic_name = ? AND partition_id = ? AND offset_id >= ?
+                FROM %s
+                WHERE partition_id = ? AND offset_id >= ?
                 ORDER BY offset_id
                 LIMIT 500
-                """)) {
-            ps.setString(1, tp.topic());
-            ps.setInt(2, tp.partition());
-            ps.setLong(3, startOffset);
+                """, tableName);
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, tp.partition());
+            ps.setLong(2, startOffset);
 
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {

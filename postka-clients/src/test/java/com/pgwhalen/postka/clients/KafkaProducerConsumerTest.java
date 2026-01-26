@@ -1,5 +1,8 @@
 package com.pgwhalen.postka.clients;
 
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
@@ -79,6 +82,22 @@ public class KafkaProducerConsumerTest
             record.headers().add(header.getKey(), header.getValue());
         }
         return producer.send(record);
+    }
+
+    @Override
+    protected Future<?> sendToPartition(KafkaProducer<String, String> producer, String topic,
+                                         int partition, String key, String value) {
+        return producer.send(new ProducerRecord<>(topic, partition, key, value));
+    }
+
+    @Override
+    protected void ensureTopicWithPartitions(String topic, int partitions) throws Exception {
+        Properties props = new Properties();
+        props.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers());
+        try (Admin admin = Admin.create(props)) {
+            NewTopic newTopic = new NewTopic(topic, partitions, (short) 1);
+            admin.createTopics(List.of(newTopic)).all().get();
+        }
     }
 
     @Override

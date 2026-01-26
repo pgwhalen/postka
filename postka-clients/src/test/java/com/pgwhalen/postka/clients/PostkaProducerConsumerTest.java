@@ -19,6 +19,8 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -95,6 +97,22 @@ public class PostkaProducerConsumerTest
             headerList.add(new RecordHeader(header.getKey(), header.getValue()));
         }
         return producer.send(new ProducerRecord<>(topic, null, null, key, value, headerList));
+    }
+
+    @Override
+    protected Future<?> sendToPartition(PostkaProducer<String, String> producer, String topic,
+                                         int partition, String key, String value) {
+        return producer.send(new ProducerRecord<>(topic, partition, key, value));
+    }
+
+    @Override
+    protected void ensureTopicWithPartitions(String topic, int partitions) throws Exception {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT postka_ensure_topic(?, ?)")) {
+            ps.setString(1, topic);
+            ps.setInt(2, partitions);
+            ps.execute();
+        }
     }
 
     @Override
