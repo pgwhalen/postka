@@ -36,7 +36,6 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
     private final Deserializer<V> valueDeserializer;
     private final Set<String> subscribedTopics = ConcurrentHashMap.newKeySet();
     private final Map<TopicPartition, Long> positions = new ConcurrentHashMap<>();
-    private final Map<String, String> topicTableNames = new ConcurrentHashMap<>();
     private volatile boolean closed = false;
     private Connection connection;
     private PreparedStatement commitOffsetStatement;
@@ -79,7 +78,6 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
         subscribedTopics.clear();
         subscribedTopics.addAll(topics);
         positions.clear();
-        topicTableNames.clear();
         // Acquire connection for polling
         try {
             closeConnection();
@@ -104,7 +102,6 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
     public void unsubscribe() {
         subscribedTopics.clear();
         positions.clear();
-        topicTableNames.clear();
         closeConnection();
     }
 
@@ -159,15 +156,15 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
 
             try {
                 for (String topic : subscribedTopics) {
-                    // Get partitions and build offset map for this topic
-                    List<Integer> partitions = getPartitions(connection, topic);
+                    // Build partition offset map from current positions for this topic
                     Map<Integer, Long> partitionOffsets = new HashMap<>();
-                    for (int partition : partitions) {
-                        TopicPartition tp = new TopicPartition(topic, partition);
-                        partitionOffsets.put(partition, positions.getOrDefault(tp, 0L));
+                    for (Map.Entry<TopicPartition, Long> entry : positions.entrySet()) {
+                        if (entry.getKey().topic().equals(topic)) {
+                            partitionOffsets.put(entry.getKey().partition(), entry.getValue());
+                        }
                     }
 
-                    // Fetch all partitions in a single query
+                    // Fetch records using the table function
                     Map<TopicPartition, List<ConsumerRecord<K, V>>> topicRecords =
                             fetchRecordsForTopic(connection, topic, partitionOffsets);
 
@@ -210,84 +207,21 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
         throw new IllegalStateException("Consumer is closed");
     }
 
-    private List<Integer> getPartitions(Connection conn, String topic) throws SQLException {
-        List<Integer> partitions = new ArrayList<>();
-        try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT partition_count FROM postka_topics WHERE topic_name = ?")) {
-            ps.setString(1, topic);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    int partitionCount = rs.getInt(1);
-                    for (int i = 0; i < partitionCount; i++) {
-                        partitions.add(i);
-                    }
-                }
-            }
-        }
-        return partitions;
-    }
-
-    private String getRecordsTableName(Connection conn, String topic) throws SQLException {
-        String tableName = topicTableNames.get(topic);
-        if (tableName != null) {
-            return tableName;
-        }
-
-        try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT postka_get_records_table(?)")) {
-            ps.setString(1, topic);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    tableName = rs.getString(1);
-                    if (tableName != null) {
-                        topicTableNames.put(topic, tableName);
-                    }
-                }
-            }
-        }
-        return tableName;
-    }
-
     private Map<TopicPartition, List<ConsumerRecord<K, V>>> fetchRecordsForTopic(
             Connection conn, String topic, Map<Integer, Long> partitionOffsets) throws SQLException {
         Map<TopicPartition, List<ConsumerRecord<K, V>>> result = new HashMap<>();
 
-        String tableName = getRecordsTableName(conn, topic);
-        if (tableName == null || partitionOffsets.isEmpty()) {
-            return result;
-        }
+        // Build array of (partition_id, start_offset) tuples for the function
+        String partitionOffsetsArray = buildPartitionOffsetsArray(partitionOffsets);
 
-        // Build OR clauses for each partition with its starting offset
-        StringBuilder whereClause = new StringBuilder();
-        List<Object> params = new ArrayList<>();
-        boolean first = true;
-        for (Map.Entry<Integer, Long> entry : partitionOffsets.entrySet()) {
-            if (!first) {
-                whereClause.append(" OR ");
-            }
-            whereClause.append("(partition_id = ? AND offset_id >= ?)");
-            params.add(entry.getKey());
-            params.add(entry.getValue());
-            first = false;
-        }
-
-        String sql = String.format(
-                """
+        String sql = """
                 SELECT partition_id, offset_id, record_timestamp, key_bytes, value_bytes, headers
-                FROM %s
-                WHERE %s
-                ORDER BY partition_id, offset_id
-                """, tableName, whereClause);
+                FROM postka_fetch_records(?, ?::postka_partition_offset[])
+                """;
 
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            for (int i = 0; i < params.size(); i++) {
-                Object param = params.get(i);
-                if (param instanceof Integer) {
-                    ps.setInt(i + 1, (Integer) param);
-                } else {
-                    ps.setLong(i + 1, (Long) param);
-                }
-            }
+            ps.setString(1, topic);
+            ps.setString(2, partitionOffsetsArray);
 
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
@@ -315,6 +249,23 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
             }
         }
         return result;
+    }
+
+    private String buildPartitionOffsetsArray(Map<Integer, Long> partitionOffsets) {
+        if (partitionOffsets == null || partitionOffsets.isEmpty()) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<Integer, Long> entry : partitionOffsets.entrySet()) {
+            if (!first) {
+                sb.append(",");
+            }
+            sb.append("\"(").append(entry.getKey()).append(",").append(entry.getValue()).append(")\"");
+            first = false;
+        }
+        sb.append("}");
+        return sb.toString();
     }
 
     private RecordHeaders parseHeaders(Array headersArray) throws SQLException {

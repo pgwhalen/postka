@@ -177,3 +177,72 @@ CREATE TRIGGER trg_postka_partition_count
     BEFORE UPDATE OF partition_count ON postka_topics
     FOR EACH ROW
     EXECUTE FUNCTION postka_partition_count_trigger();
+
+-- Composite type for partition offset requests
+CREATE TYPE postka_partition_offset AS (
+    partition_id INTEGER,
+    start_offset BIGINT
+);
+
+-- Table function to fetch records for a topic given partition/offset pairs
+-- Returns records starting at each specified offset for each partition
+CREATE OR REPLACE FUNCTION postka_fetch_records(
+    p_topic TEXT,
+    p_partition_offsets postka_partition_offset[]
+)
+RETURNS TABLE (
+    partition_id INTEGER,
+    offset_id BIGINT,
+    record_timestamp TIMESTAMP WITH TIME ZONE,
+    key_bytes BYTEA,
+    value_bytes BYTEA,
+    headers postka_header[]
+) AS $$
+DECLARE
+    table_name TEXT;
+    partition_count INTEGER;
+    po postka_partition_offset;
+    where_clauses TEXT[];
+    where_clause TEXT;
+    i INTEGER;
+BEGIN
+    -- Get table name and partition count for topic
+    SELECT t.records_table_name, t.partition_count
+    INTO table_name, partition_count
+    FROM postka_topics t
+    WHERE t.topic_name = p_topic;
+
+    IF table_name IS NULL THEN
+        RETURN;
+    END IF;
+
+    -- If no partition offsets provided, use all partitions starting at offset 0
+    IF p_partition_offsets IS NULL OR array_length(p_partition_offsets, 1) IS NULL THEN
+        p_partition_offsets := ARRAY[]::postka_partition_offset[];
+        FOR i IN 0..(partition_count - 1) LOOP
+            p_partition_offsets := array_append(p_partition_offsets, ROW(i, 0)::postka_partition_offset);
+        END LOOP;
+    END IF;
+
+    -- Build WHERE clause from partition/offset pairs
+    where_clauses := ARRAY[]::TEXT[];
+    FOREACH po IN ARRAY p_partition_offsets LOOP
+        where_clauses := array_append(where_clauses,
+            format('(partition_id = %s AND offset_id >= %s)', po.partition_id, po.start_offset));
+    END LOOP;
+
+    IF array_length(where_clauses, 1) IS NULL THEN
+        RETURN;
+    END IF;
+
+    where_clause := array_to_string(where_clauses, ' OR ');
+
+    -- Execute dynamic query and return results
+    RETURN QUERY EXECUTE format(
+        'SELECT r.partition_id, r.offset_id, r.record_timestamp, r.key_bytes, r.value_bytes, r.headers
+         FROM %I r
+         WHERE %s
+         ORDER BY r.partition_id, r.offset_id',
+        table_name, where_clause);
+END;
+$$ LANGUAGE plpgsql;
