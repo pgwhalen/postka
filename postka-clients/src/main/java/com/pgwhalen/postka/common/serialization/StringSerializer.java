@@ -9,7 +9,6 @@ public class StringSerializer implements Serializer<String> {
 
     @Override
     public byte[] serialize(String topic, String data) {
-        System.out.println("HI");
         if (data == null) {
             return null;
         }
