@@ -125,8 +125,10 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
 
     /**
      * Fetch data for the topics or partitions specified using subscribe.
+     * This method blocks for at most the given timeout waiting for records.
      *
-     * @param timeout The time to block waiting for data
+     * @param timeout The maximum time to block waiting for data. If zero or negative,
+     *                returns immediately with any available records (or empty if none).
      * @return A ConsumerRecords object with the fetched records
      */
     public ConsumerRecords<K, V> poll(Duration timeout) {
@@ -137,31 +139,57 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
             return ConsumerRecords.empty();
         }
 
-        Map<TopicPartition, List<ConsumerRecord<K, V>>> result = new HashMap<>();
+        long timeoutMillis = timeout.toMillis();
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        long pollIntervalMillis = 100; // Poll the database every 100ms
 
-        try (Connection conn = dataSource.getConnection()) {
-            for (String topic : subscribedTopics) {
-                // Get partitions for this topic
-                List<Integer> partitions = getPartitions(conn, topic);
+        while (!closed) {
+            Map<TopicPartition, List<ConsumerRecord<K, V>>> result = new HashMap<>();
 
-                for (int partition : partitions) {
-                    TopicPartition tp = new TopicPartition(topic, partition);
-                    long startOffset = positions.getOrDefault(tp, 0L);
+            try (Connection conn = dataSource.getConnection()) {
+                for (String topic : subscribedTopics) {
+                    // Get partitions for this topic
+                    List<Integer> partitions = getPartitions(conn, topic);
 
-                    List<ConsumerRecord<K, V>> records = fetchRecords(conn, tp, startOffset);
-                    if (!records.isEmpty()) {
-                        result.put(tp, records);
-                        // Update position to after last record
-                        long lastOffset = records.getLast().offset();
-                        positions.put(tp, lastOffset + 1);
+                    for (int partition : partitions) {
+                        TopicPartition tp = new TopicPartition(topic, partition);
+                        long startOffset = positions.getOrDefault(tp, 0L);
+
+                        List<ConsumerRecord<K, V>> records = fetchRecords(conn, tp, startOffset);
+                        if (!records.isEmpty()) {
+                            result.put(tp, records);
+                            // Update position to after last record
+                            long lastOffset = records.getLast().offset();
+                            positions.put(tp, lastOffset + 1);
+                        }
                     }
                 }
+            } catch (SQLException e) {
+                throw new RuntimeException("Failed to poll records", e);
             }
-        } catch (SQLException e) {
-            throw new RuntimeException("Failed to poll records", e);
+
+            // If we found records, return immediately
+            if (!result.isEmpty()) {
+                return new ConsumerRecords<>(result);
+            }
+
+            // If timeout is zero or negative, or we've exceeded the deadline, return empty
+            long remaining = deadline - System.currentTimeMillis();
+            if (timeoutMillis <= 0 || remaining <= 0) {
+                return ConsumerRecords.empty();
+            }
+
+            // Wait before polling again, but not longer than remaining time
+            try {
+                Thread.sleep(Math.min(pollIntervalMillis, remaining));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return ConsumerRecords.empty();
+            }
         }
 
-        return new ConsumerRecords<>(result);
+        // Consumer was closed during poll
+        throw new IllegalStateException("Consumer is closed");
     }
 
     private List<Integer> getPartitions(Connection conn, String topic) throws SQLException {

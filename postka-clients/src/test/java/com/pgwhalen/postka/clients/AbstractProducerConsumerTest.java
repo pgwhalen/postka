@@ -301,6 +301,92 @@ public abstract class AbstractProducerConsumerTest<P, C> {
     }
 
     @Test
+    void testPollTimeoutReturnsImmediatelyWithZeroTimeout() throws Exception {
+        String topic = uniqueTopic();
+        C consumer = createConsumer("test-group-timeout-zero-" + System.currentTimeMillis());
+
+        try {
+            subscribe(consumer, List.of(topic));
+
+            // With zero timeout, poll should return immediately even with no records
+            long start = System.currentTimeMillis();
+            List<TestRecord> records = poll(consumer, Duration.ZERO);
+            long elapsed = System.currentTimeMillis() - start;
+
+            assertTrue(records.isEmpty(), "Should have no records");
+            assertTrue(elapsed < 500, "Zero timeout poll should return quickly, took " + elapsed + "ms");
+        } finally {
+            closeConsumer(consumer);
+        }
+    }
+
+    @Test
+    void testPollTimeoutBlocksWhenNoRecords() throws Exception {
+        String topic = uniqueTopic();
+        C consumer = createConsumer("test-group-timeout-blocks-" + System.currentTimeMillis());
+
+        try {
+            subscribe(consumer, List.of(topic));
+
+            // Poll should block for approximately the timeout duration when no records exist
+            long timeoutMs = 1000;
+            long start = System.currentTimeMillis();
+            List<TestRecord> records = poll(consumer, Duration.ofMillis(timeoutMs));
+            long elapsed = System.currentTimeMillis() - start;
+
+            assertTrue(records.isEmpty(), "Should have no records");
+            // Should have blocked for at least most of the timeout (allow 200ms tolerance)
+            assertTrue(elapsed >= timeoutMs - 200,
+                    "Poll should have blocked for at least " + (timeoutMs - 200) + "ms, but only took " + elapsed + "ms");
+            // Should not have blocked for much longer than the timeout (allow 500ms tolerance for slow CI)
+            assertTrue(elapsed < timeoutMs + 500,
+                    "Poll should not block much longer than timeout, took " + elapsed + "ms");
+        } finally {
+            closeConsumer(consumer);
+        }
+    }
+
+    @Test
+    void testPollReturnsImmediatelyWhenRecordsAvailable() throws Exception {
+        String topic = uniqueTopic();
+        P producer = createProducer();
+        C consumer = createConsumer("test-group-timeout-immediate-" + System.currentTimeMillis());
+
+        try {
+            // Send a message first
+            send(producer, topic, "key1", "value1").get(10, TimeUnit.SECONDS);
+
+            // Subscribe and poll with a long timeout
+            subscribe(consumer, List.of(topic));
+
+            // First poll may need to wait for partition assignment, so we warm up
+            List<TestRecord> warmup = new ArrayList<>();
+            long warmupDeadline = System.currentTimeMillis() + 10_000;
+            while (warmup.isEmpty() && System.currentTimeMillis() < warmupDeadline) {
+                warmup.addAll(poll(consumer, Duration.ofMillis(500)));
+            }
+            assertFalse(warmup.isEmpty(), "Should have received the warmup record");
+
+            // Now send another message
+            send(producer, topic, "key2", "value2").get(10, TimeUnit.SECONDS);
+
+            // Poll with a long timeout - should return quickly since records are available
+            long longTimeoutMs = 10_000;
+            long start = System.currentTimeMillis();
+            List<TestRecord> records = poll(consumer, Duration.ofMillis(longTimeoutMs));
+            long elapsed = System.currentTimeMillis() - start;
+
+            assertFalse(records.isEmpty(), "Should have received records");
+            // Should return quickly, not wait for the full timeout
+            assertTrue(elapsed < 2000,
+                    "Poll with available records should return quickly, but took " + elapsed + "ms");
+        } finally {
+            closeProducer(producer);
+            closeConsumer(consumer);
+        }
+    }
+
+    @Test
     void testRecordHeaders() throws Exception {
         String topic = uniqueTopic();
         P producer = createProducer();
