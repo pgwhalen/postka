@@ -38,6 +38,8 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
     private final Map<TopicPartition, Long> positions = new ConcurrentHashMap<>();
     private final Map<String, String> topicTableNames = new ConcurrentHashMap<>();
     private volatile boolean closed = false;
+    private Connection connection;
+    private PreparedStatement commitOffsetStatement;
 
     /**
      * A consumer is instantiated by providing configuration properties.
@@ -77,6 +79,14 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
         subscribedTopics.clear();
         subscribedTopics.addAll(topics);
         positions.clear();
+        topicTableNames.clear();
+        // Acquire connection for polling
+        try {
+            closeConnection();
+            connection = dataSource.getConnection();
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to acquire connection", e);
+        }
         // Load committed offsets for subscribed topics
         loadCommittedOffsets();
     }
@@ -95,14 +105,15 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
         subscribedTopics.clear();
         positions.clear();
         topicTableNames.clear();
+        closeConnection();
     }
 
     private void loadCommittedOffsets() {
-        if (groupId == null) return;
+        if (groupId == null || connection == null) return;
 
-        try (Connection conn = dataSource.getConnection()) {
+        try {
             for (String topic : subscribedTopics) {
-                try (PreparedStatement ps = conn.prepareStatement(
+                try (PreparedStatement ps = connection.prepareStatement(
                         """
                         SELECT partition_id, committed_offset
                         FROM postka_consumer_offsets
@@ -135,7 +146,7 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
         if (closed) {
             throw new IllegalStateException("Consumer is closed");
         }
-        if (subscribedTopics.isEmpty()) {
+        if (subscribedTopics.isEmpty() || connection == null) {
             return ConsumerRecords.empty();
         }
 
@@ -146,19 +157,26 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
         while (!closed) {
             Map<TopicPartition, List<ConsumerRecord<K, V>>> result = new HashMap<>();
 
-            try (Connection conn = dataSource.getConnection()) {
+            try {
                 for (String topic : subscribedTopics) {
-                    // Get partitions for this topic
-                    List<Integer> partitions = getPartitions(conn, topic);
-
+                    // Get partitions and build offset map for this topic
+                    List<Integer> partitions = getPartitions(connection, topic);
+                    Map<Integer, Long> partitionOffsets = new HashMap<>();
                     for (int partition : partitions) {
                         TopicPartition tp = new TopicPartition(topic, partition);
-                        long startOffset = positions.getOrDefault(tp, 0L);
+                        partitionOffsets.put(partition, positions.getOrDefault(tp, 0L));
+                    }
 
-                        List<ConsumerRecord<K, V>> records = fetchRecords(conn, tp, startOffset);
+                    // Fetch all partitions in a single query
+                    Map<TopicPartition, List<ConsumerRecord<K, V>>> topicRecords =
+                            fetchRecordsForTopic(connection, topic, partitionOffsets);
+
+                    // Update positions and collect results
+                    for (Map.Entry<TopicPartition, List<ConsumerRecord<K, V>>> entry : topicRecords.entrySet()) {
+                        TopicPartition tp = entry.getKey();
+                        List<ConsumerRecord<K, V>> records = entry.getValue();
                         if (!records.isEmpty()) {
                             result.put(tp, records);
-                            // Update position to after last record
                             long lastOffset = records.getLast().offset();
                             positions.put(tp, lastOffset + 1);
                         }
@@ -230,28 +248,50 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
         return tableName;
     }
 
-    private List<ConsumerRecord<K, V>> fetchRecords(Connection conn, TopicPartition tp,
-                                                    long startOffset) throws SQLException {
-        String tableName = getRecordsTableName(conn, tp.topic());
-        if (tableName == null) {
-            return new ArrayList<>();
+    private Map<TopicPartition, List<ConsumerRecord<K, V>>> fetchRecordsForTopic(
+            Connection conn, String topic, Map<Integer, Long> partitionOffsets) throws SQLException {
+        Map<TopicPartition, List<ConsumerRecord<K, V>>> result = new HashMap<>();
+
+        String tableName = getRecordsTableName(conn, topic);
+        if (tableName == null || partitionOffsets.isEmpty()) {
+            return result;
         }
 
-        List<ConsumerRecord<K, V>> records = new ArrayList<>();
+        // Build OR clauses for each partition with its starting offset
+        StringBuilder whereClause = new StringBuilder();
+        List<Object> params = new ArrayList<>();
+        boolean first = true;
+        for (Map.Entry<Integer, Long> entry : partitionOffsets.entrySet()) {
+            if (!first) {
+                whereClause.append(" OR ");
+            }
+            whereClause.append("(partition_id = ? AND offset_id >= ?)");
+            params.add(entry.getKey());
+            params.add(entry.getValue());
+            first = false;
+        }
+
         String sql = String.format(
                 """
-                SELECT offset_id, record_timestamp, key_bytes, value_bytes, headers
+                SELECT partition_id, offset_id, record_timestamp, key_bytes, value_bytes, headers
                 FROM %s
-                WHERE partition_id = ? AND offset_id >= ?
-                ORDER BY offset_id
-                LIMIT 500
-                """, tableName);
+                WHERE %s
+                ORDER BY partition_id, offset_id
+                """, tableName, whereClause);
+
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setInt(1, tp.partition());
-            ps.setLong(2, startOffset);
+            for (int i = 0; i < params.size(); i++) {
+                Object param = params.get(i);
+                if (param instanceof Integer) {
+                    ps.setInt(i + 1, (Integer) param);
+                } else {
+                    ps.setLong(i + 1, (Long) param);
+                }
+            }
 
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
+                    int partition = rs.getInt("partition_id");
                     long offset = rs.getLong("offset_id");
                     Timestamp ts = rs.getTimestamp("record_timestamp");
                     long timestamp = ts != null ? ts.getTime() : 0L;
@@ -260,12 +300,13 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
                     RecordHeaders headers = parseHeaders(rs.getArray("headers"));
 
                     K key = keyDeserializer != null ?
-                            keyDeserializer.deserialize(tp.topic(), keyBytes) : null;
+                            keyDeserializer.deserialize(topic, keyBytes) : null;
                     V value = valueDeserializer != null ?
-                            valueDeserializer.deserialize(tp.topic(), valueBytes) : null;
+                            valueDeserializer.deserialize(topic, valueBytes) : null;
 
-                    records.add(new ConsumerRecord<>(
-                            tp.topic(), tp.partition(), offset, timestamp,
+                    TopicPartition tp = new TopicPartition(topic, partition);
+                    result.computeIfAbsent(tp, k -> new ArrayList<>()).add(new ConsumerRecord<>(
+                            topic, partition, offset, timestamp,
                             keyBytes != null ? keyBytes.length : -1,
                             valueBytes != null ? valueBytes.length : -1,
                             key, value, headers
@@ -273,7 +314,7 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
                 }
             }
         }
-        return records;
+        return result;
     }
 
     private RecordHeaders parseHeaders(Array headersArray) throws SQLException {
@@ -372,13 +413,16 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
         if (groupId == null) {
             throw new IllegalStateException("Cannot commit offsets without a group.id");
         }
+        if (connection == null) {
+            throw new IllegalStateException("Consumer is not subscribed");
+        }
 
-        try (Connection conn = dataSource.getConnection()) {
+        try {
             for (Map.Entry<TopicPartition, Long> entry : positions.entrySet()) {
                 TopicPartition tp = entry.getKey();
                 long position = entry.getValue();
                 if (position > 0) {
-                    commitOffset(conn, tp, position - 1); // Commit last consumed
+                    commitOffset(tp, position - 1); // Commit last consumed
                 }
             }
         } catch (SQLException e) {
@@ -386,21 +430,22 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
         }
     }
 
-    private void commitOffset(Connection conn, TopicPartition tp, long offset) throws SQLException {
-        try (PreparedStatement ps = conn.prepareStatement(
-                """
-                INSERT INTO postka_consumer_offsets (group_id, topic_name, partition_id, committed_offset)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT (group_id, topic_name, partition_id)
-                DO UPDATE SET committed_offset = EXCLUDED.committed_offset,
-                              committed_at = (NOW() AT TIME ZONE 'UTC')
-                """)) {
-            ps.setString(1, groupId);
-            ps.setString(2, tp.topic());
-            ps.setInt(3, tp.partition());
-            ps.setLong(4, offset);
-            ps.executeUpdate();
+    private void commitOffset(TopicPartition tp, long offset) throws SQLException {
+        if (commitOffsetStatement == null) {
+            commitOffsetStatement = connection.prepareStatement(
+                    """
+                    INSERT INTO postka_consumer_offsets (group_id, topic_name, partition_id, committed_offset)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT (group_id, topic_name, partition_id)
+                    DO UPDATE SET committed_offset = EXCLUDED.committed_offset,
+                                  committed_at = (NOW() AT TIME ZONE 'UTC')
+                    """);
         }
+        commitOffsetStatement.setString(1, groupId);
+        commitOffsetStatement.setString(2, tp.topic());
+        commitOffsetStatement.setInt(3, tp.partition());
+        commitOffsetStatement.setLong(4, offset);
+        commitOffsetStatement.executeUpdate();
     }
 
     /**
@@ -438,5 +483,26 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
      */
     public void close(Duration timeout) {
         closed = true;
+        closeConnection();
+    }
+
+    private void closeConnection() {
+        if (commitOffsetStatement != null) {
+            try {
+                commitOffsetStatement.close();
+            } catch (SQLException e) {
+                // Ignore close errors
+            }
+            commitOffsetStatement = null;
+        }
+
+        if (connection != null) {
+            try {
+                connection.close();
+            } catch (SQLException e) {
+                // Ignore close errors
+            }
+            connection = null;
+        }
     }
 }
