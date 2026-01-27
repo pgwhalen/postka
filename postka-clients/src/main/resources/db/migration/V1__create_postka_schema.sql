@@ -246,3 +246,35 @@ BEGIN
         table_name, where_clause);
 END;
 $$ LANGUAGE plpgsql;
+
+-- Function to insert a record into a topic
+-- Handles topic creation, offset assignment, and record insertion
+-- Returns the assigned offset
+CREATE OR REPLACE FUNCTION postka_insert_record(
+    p_topic TEXT,
+    p_partition INTEGER,
+    p_timestamp TIMESTAMP WITH TIME ZONE,
+    p_key_bytes BYTEA,
+    p_value_bytes BYTEA,
+    p_headers postka_header[]
+)
+RETURNS BIGINT AS $$
+DECLARE
+    table_name TEXT;
+    assigned_offset BIGINT;
+BEGIN
+    -- Ensure topic exists and get the records table name
+    table_name := postka_ensure_topic(p_topic, 1);
+
+    -- Get next offset and insert record atomically
+    EXECUTE format(
+        'INSERT INTO %I (partition_id, offset_id, record_timestamp, key_bytes, value_bytes, headers)
+         VALUES ($1, postka_next_offset(%L, $1), $2, $3, $4, $5)
+         RETURNING offset_id',
+        table_name, table_name)
+    INTO assigned_offset
+    USING p_partition, p_timestamp, p_key_bytes, p_value_bytes, p_headers;
+
+    RETURN assigned_offset;
+END;
+$$ LANGUAGE plpgsql;

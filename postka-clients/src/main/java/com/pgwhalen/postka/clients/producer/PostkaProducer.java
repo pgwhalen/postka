@@ -120,54 +120,27 @@ public class PostkaProducer<K, V> implements AutoCloseable {
         int partition = record.partition() != null ? record.partition() : 0;
 
         try (Connection conn = dataSource.getConnection()) {
-            conn.setAutoCommit(false);
-            try {
-                // Ensure topic exists and get the records table name
-                String recordsTableName;
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "SELECT postka_ensure_topic(?, 1)")) {
-                    ps.setString(1, record.topic());
-                    try (ResultSet rs = ps.executeQuery()) {
-                        rs.next();
-                        recordsTableName = rs.getString(1);
-                    }
+            String sql = "SELECT postka_insert_record(?, ?, ?, ?, ?, ?)";
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, record.topic());
+                ps.setInt(2, partition);
+                ps.setTimestamp(3, Timestamp.from(Instant.ofEpochMilli(timestamp)));
+                ps.setBytes(4, keyBytes);
+                ps.setBytes(5, valueBytes);
+                ps.setArray(6, createHeadersArray(conn, record.headers()));
+
+                try (ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    long offset = rs.getLong(1);
+
+                    return new RecordMetadata(
+                            new TopicPartition(record.topic(), partition),
+                            offset,
+                            timestamp,
+                            keyBytes != null ? keyBytes.length : -1,
+                            valueBytes != null ? valueBytes.length : -1
+                    );
                 }
-
-                // Get next offset and insert record atomically
-                long offset;
-                String insertSql = String.format(
-                        """
-                        INSERT INTO %s
-                            (partition_id, offset_id, record_timestamp, key_bytes, value_bytes, headers)
-                        VALUES (?, postka_next_offset('%s', ?), ?, ?, ?, ?)
-                        RETURNING offset_id
-                        """, recordsTableName, recordsTableName);
-                try (PreparedStatement ps = conn.prepareStatement(insertSql)) {
-                    ps.setInt(1, partition);
-                    ps.setInt(2, partition);
-                    ps.setTimestamp(3, Timestamp.from(Instant.ofEpochMilli(timestamp)));
-                    ps.setBytes(4, keyBytes);
-                    ps.setBytes(5, valueBytes);
-                    ps.setArray(6, createHeadersArray(conn, record.headers()));
-
-                    try (ResultSet rs = ps.executeQuery()) {
-                        rs.next();
-                        offset = rs.getLong(1);
-                    }
-                }
-
-                conn.commit();
-
-                return new RecordMetadata(
-                        new TopicPartition(record.topic(), partition),
-                        offset,
-                        timestamp,
-                        keyBytes != null ? keyBytes.length : -1,
-                        valueBytes != null ? valueBytes.length : -1
-                );
-            } catch (SQLException e) {
-                conn.rollback();
-                throw e;
             }
         }
     }
