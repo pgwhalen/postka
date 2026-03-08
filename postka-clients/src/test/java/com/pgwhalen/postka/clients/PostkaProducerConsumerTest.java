@@ -3,12 +3,14 @@ package com.pgwhalen.postka.clients;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import com.pgwhalen.postka.clients.consumer.ConsumerConfig;
+import com.pgwhalen.postka.clients.consumer.ConsumerRebalanceListener;
 import com.pgwhalen.postka.clients.consumer.ConsumerRecord;
 import com.pgwhalen.postka.clients.consumer.ConsumerRecords;
 import com.pgwhalen.postka.clients.consumer.PostkaConsumer;
 import com.pgwhalen.postka.clients.producer.PostkaProducer;
 import com.pgwhalen.postka.clients.producer.ProducerConfig;
 import com.pgwhalen.postka.clients.producer.ProducerRecord;
+import com.pgwhalen.postka.common.TopicPartition;
 import com.pgwhalen.postka.common.header.RecordHeader;
 import com.pgwhalen.postka.common.serialization.StringDeserializer;
 import com.pgwhalen.postka.common.serialization.StringSerializer;
@@ -25,8 +27,10 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -143,5 +147,40 @@ public class PostkaProducerConsumerTest
     @Override
     protected void closeConsumer(PostkaConsumer<String, String> consumer) {
         consumer.close();
+    }
+
+    @Override
+    protected void subscribeWithListener(PostkaConsumer<String, String> consumer, Collection<String> topics,
+                                          TestRebalanceListener listener) {
+        consumer.subscribe(topics, new ConsumerRebalanceListener() {
+            @Override
+            public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
+                Set<TestTopicPartition> converted = new HashSet<>();
+                for (TopicPartition tp : partitions) {
+                    converted.add(new TestTopicPartition(tp.topic(), tp.partition()));
+                }
+                listener.onRevoked(converted);
+            }
+
+            @Override
+            public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
+                Set<TestTopicPartition> converted = new HashSet<>();
+                for (TopicPartition tp : partitions) {
+                    converted.add(new TestTopicPartition(tp.topic(), tp.partition()));
+                }
+                listener.onAssigned(converted);
+            }
+        });
+    }
+
+    @Override
+    protected Set<Integer> getAssignedPartitions(PostkaConsumer<String, String> consumer, String topic) {
+        Set<Integer> partitions = new HashSet<>();
+        for (TopicPartition tp : consumer.assignment()) {
+            if (tp.topic().equals(topic)) {
+                partitions.add(tp.partition());
+            }
+        }
+        return partitions;
     }
 }

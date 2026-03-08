@@ -35,6 +35,29 @@ public class ConsumerConfig {
      */
     public static final String ENABLE_AUTO_COMMIT_CONFIG = "enable.auto.commit";
 
+    /**
+     * The expected time between heartbeats to the group coordinator when using consumer group
+     * management. Heartbeats are used to ensure that the consumer's session stays active.
+     */
+    public static final String HEARTBEAT_INTERVAL_MS_CONFIG = "heartbeat.interval.ms";
+
+    /**
+     * The timeout used to detect consumer failures when using consumer group management. If no
+     * heartbeats are received by the broker before the expiration of this session timeout,
+     * the broker will remove this consumer from the group and initiate a rebalance.
+     */
+    public static final String SESSION_TIMEOUT_MS_CONFIG = "session.timeout.ms";
+
+    /**
+     * Default heartbeat interval in milliseconds.
+     */
+    public static final int DEFAULT_HEARTBEAT_INTERVAL_MS = 3000;
+
+    /**
+     * Default session timeout in milliseconds.
+     */
+    public static final int DEFAULT_SESSION_TIMEOUT_MS = 10000;
+
     private ConsumerConfig() {
     }
 }

@@ -4,12 +4,14 @@ import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.BeforeAll;
@@ -20,9 +22,11 @@ import org.testcontainers.kafka.KafkaContainer;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -128,5 +132,40 @@ public class KafkaProducerConsumerTest
     @Override
     protected void closeConsumer(KafkaConsumer<String, String> consumer) {
         consumer.close();
+    }
+
+    @Override
+    protected void subscribeWithListener(KafkaConsumer<String, String> consumer, Collection<String> topics,
+                                          TestRebalanceListener listener) {
+        consumer.subscribe(topics, new ConsumerRebalanceListener() {
+            @Override
+            public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
+                Set<TestTopicPartition> converted = new HashSet<>();
+                for (TopicPartition tp : partitions) {
+                    converted.add(new TestTopicPartition(tp.topic(), tp.partition()));
+                }
+                listener.onRevoked(converted);
+            }
+
+            @Override
+            public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
+                Set<TestTopicPartition> converted = new HashSet<>();
+                for (TopicPartition tp : partitions) {
+                    converted.add(new TestTopicPartition(tp.topic(), tp.partition()));
+                }
+                listener.onAssigned(converted);
+            }
+        });
+    }
+
+    @Override
+    protected Set<Integer> getAssignedPartitions(KafkaConsumer<String, String> consumer, String topic) {
+        Set<Integer> partitions = new HashSet<>();
+        for (TopicPartition tp : consumer.assignment()) {
+            if (tp.topic().equals(topic)) {
+                partitions.add(tp.partition());
+            }
+        }
+        return partitions;
     }
 }

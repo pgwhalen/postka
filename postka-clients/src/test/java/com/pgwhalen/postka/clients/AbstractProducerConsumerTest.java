@@ -7,10 +7,16 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -47,6 +53,47 @@ public abstract class AbstractProducerConsumerTest<P, C> {
     protected abstract Future<?> sendToPartition(P producer, String topic, int partition, String key, String value);
 
     protected abstract void ensureTopicWithPartitions(String topic, int partitions) throws Exception;
+
+    protected abstract void subscribeWithListener(C consumer, Collection<String> topics,
+                                                   TestRebalanceListener listener);
+
+    protected abstract Set<Integer> getAssignedPartitions(C consumer, String topic);
+
+    /**
+     * Helper class to track rebalance events during tests.
+     */
+    protected static class TestRebalanceListener {
+        private final List<Set<TestTopicPartition>> revokedHistory = new CopyOnWriteArrayList<>();
+        private final List<Set<TestTopicPartition>> assignedHistory = new CopyOnWriteArrayList<>();
+        private final CountDownLatch assignmentLatch;
+
+        public TestRebalanceListener(int expectedAssignments) {
+            this.assignmentLatch = new CountDownLatch(expectedAssignments);
+        }
+
+        public void onRevoked(Collection<TestTopicPartition> partitions) {
+            revokedHistory.add(new HashSet<>(partitions));
+        }
+
+        public void onAssigned(Collection<TestTopicPartition> partitions) {
+            assignedHistory.add(new HashSet<>(partitions));
+            assignmentLatch.countDown();
+        }
+
+        public boolean awaitAssignments(long timeout, TimeUnit unit) throws InterruptedException {
+            return assignmentLatch.await(timeout, unit);
+        }
+
+        public List<Set<TestTopicPartition>> getRevokedHistory() {
+            return Collections.unmodifiableList(revokedHistory);
+        }
+
+        public List<Set<TestTopicPartition>> getAssignedHistory() {
+            return Collections.unmodifiableList(assignedHistory);
+        }
+    }
+
+    protected record TestTopicPartition(String topic, int partition) {}
 
     protected record TestRecord(String topic, int partition, long offset, String key, String value,
                                 Map<String, byte[]> headers) {
@@ -427,6 +474,152 @@ public abstract class AbstractProducerConsumerTest<P, C> {
         } finally {
             closeProducer(producer);
             closeConsumer(consumer);
+        }
+    }
+
+    @Test
+    void testConsumerGroupRebalanceOnSecondConsumerJoin() throws Exception {
+        String topic = uniqueTopic();
+        String groupId = "test-group-rebalance-" + System.currentTimeMillis();
+        int numPartitions = 2;
+        ensureTopicWithPartitions(topic, numPartitions);
+
+        P producer = createProducer();
+        C consumer1 = createConsumer(groupId);
+        C consumer2 = createConsumer(groupId);
+
+        try {
+            // Send messages to both partitions
+            sendToPartition(producer, topic, 0, "key-p0", "value-p0").get(5, TimeUnit.SECONDS);
+            sendToPartition(producer, topic, 1, "key-p1", "value-p1").get(5, TimeUnit.SECONDS);
+
+            // Create listeners to track rebalance events
+            TestRebalanceListener listener1 = new TestRebalanceListener(2); // Initial + after consumer2 joins
+            TestRebalanceListener listener2 = new TestRebalanceListener(1); // Initial assignment
+
+            // Subscribe consumer1 - should get both partitions initially
+            subscribeWithListener(consumer1, List.of(topic), listener1);
+
+            // Poll to ensure consumer1 has joined the group and gets assignments
+            List<TestRecord> records1 = new ArrayList<>();
+            long deadline = System.currentTimeMillis() + 15_000;
+            while (records1.size() < 2 && System.currentTimeMillis() < deadline) {
+                records1.addAll(poll(consumer1, Duration.ofMillis(500)));
+            }
+
+            // Verify consumer1 initially has both partitions
+            Set<Integer> consumer1Partitions = getAssignedPartitions(consumer1, topic);
+            assertEquals(2, consumer1Partitions.size(),
+                    "Consumer1 should initially have 2 partitions, but has: " + consumer1Partitions);
+            assertTrue(consumer1Partitions.contains(0), "Consumer1 should have partition 0");
+            assertTrue(consumer1Partitions.contains(1), "Consumer1 should have partition 1");
+
+            // Now subscribe consumer2 to the same group - this should trigger rebalance
+            subscribeWithListener(consumer2, List.of(topic), listener2);
+
+            // Poll consumer2 to trigger its group join
+            poll(consumer2, Duration.ofMillis(500));
+
+            // Poll both consumers repeatedly to allow rebalance to complete
+            // Consumer1 needs to poll to detect the rebalance
+            deadline = System.currentTimeMillis() + 15_000;
+            Set<Integer> finalConsumer1Partitions = getAssignedPartitions(consumer1, topic);
+            Set<Integer> finalConsumer2Partitions = getAssignedPartitions(consumer2, topic);
+
+            while ((finalConsumer1Partitions.size() != 1 || finalConsumer2Partitions.size() != 1)
+                    && System.currentTimeMillis() < deadline) {
+                poll(consumer1, Duration.ofMillis(500));
+                poll(consumer2, Duration.ofMillis(500));
+                finalConsumer1Partitions = getAssignedPartitions(consumer1, topic);
+                finalConsumer2Partitions = getAssignedPartitions(consumer2, topic);
+            }
+
+            // Each consumer should have exactly 1 partition
+            assertEquals(1, finalConsumer1Partitions.size(),
+                    "Consumer1 should have 1 partition after rebalance, but has: " + finalConsumer1Partitions);
+            assertEquals(1, finalConsumer2Partitions.size(),
+                    "Consumer2 should have 1 partition after rebalance, but has: " + finalConsumer2Partitions);
+
+            // Verify no partition overlap
+            Set<Integer> allPartitions = new HashSet<>(finalConsumer1Partitions);
+            allPartitions.addAll(finalConsumer2Partitions);
+            assertEquals(2, allPartitions.size(), "Both partitions should be assigned");
+            assertTrue(allPartitions.contains(0), "Partition 0 should be assigned");
+            assertTrue(allPartitions.contains(1), "Partition 1 should be assigned");
+
+        } finally {
+            closeProducer(producer);
+            closeConsumer(consumer1);
+            closeConsumer(consumer2);
+        }
+    }
+
+    @Test
+    void testConsumerGroupRebalanceOnConsumerLeave() throws Exception {
+        String topic = uniqueTopic();
+        String groupId = "test-group-leave-" + System.currentTimeMillis();
+        int numPartitions = 2;
+        ensureTopicWithPartitions(topic, numPartitions);
+
+        P producer = createProducer();
+        C consumer1 = createConsumer(groupId);
+        C consumer2 = createConsumer(groupId);
+
+        try {
+            // Send messages to both partitions
+            sendToPartition(producer, topic, 0, "key-p0", "value-p0").get(5, TimeUnit.SECONDS);
+            sendToPartition(producer, topic, 1, "key-p1", "value-p1").get(5, TimeUnit.SECONDS);
+
+            // Create listeners
+            TestRebalanceListener listener1 = new TestRebalanceListener(3);
+            TestRebalanceListener listener2 = new TestRebalanceListener(1);
+
+            // Subscribe consumer1
+            subscribeWithListener(consumer1, List.of(topic), listener1);
+            poll(consumer1, Duration.ofMillis(500));
+
+            // Subscribe consumer2
+            subscribeWithListener(consumer2, List.of(topic), listener2);
+            poll(consumer2, Duration.ofMillis(500));
+
+            // Poll both repeatedly until each has 1 partition
+            long deadline = System.currentTimeMillis() + 15_000;
+            Set<Integer> consumer1PartitionsBefore = getAssignedPartitions(consumer1, topic);
+            Set<Integer> consumer2PartitionsBefore = getAssignedPartitions(consumer2, topic);
+
+            while ((consumer1PartitionsBefore.size() != 1 || consumer2PartitionsBefore.size() != 1)
+                    && System.currentTimeMillis() < deadline) {
+                poll(consumer1, Duration.ofMillis(500));
+                poll(consumer2, Duration.ofMillis(500));
+                consumer1PartitionsBefore = getAssignedPartitions(consumer1, topic);
+                consumer2PartitionsBefore = getAssignedPartitions(consumer2, topic);
+            }
+
+            assertEquals(1, consumer1PartitionsBefore.size(), "Consumer1 should have 1 partition");
+            assertEquals(1, consumer2PartitionsBefore.size(), "Consumer2 should have 1 partition");
+
+            // Close consumer2
+            closeConsumer(consumer2);
+
+            // Poll consumer1 repeatedly until it has both partitions
+            deadline = System.currentTimeMillis() + 15_000;
+            Set<Integer> consumer1PartitionsAfter = getAssignedPartitions(consumer1, topic);
+
+            while (consumer1PartitionsAfter.size() != 2 && System.currentTimeMillis() < deadline) {
+                poll(consumer1, Duration.ofMillis(500));
+                consumer1PartitionsAfter = getAssignedPartitions(consumer1, topic);
+            }
+
+            // Verify consumer1 now has both partitions
+            assertEquals(2, consumer1PartitionsAfter.size(),
+                    "Consumer1 should have 2 partitions after consumer2 leaves, but has: " + consumer1PartitionsAfter);
+            assertTrue(consumer1PartitionsAfter.contains(0), "Consumer1 should have partition 0");
+            assertTrue(consumer1PartitionsAfter.contains(1), "Consumer1 should have partition 1");
+
+        } finally {
+            closeProducer(producer);
+            closeConsumer(consumer1);
+            // consumer2 already closed
         }
     }
 }

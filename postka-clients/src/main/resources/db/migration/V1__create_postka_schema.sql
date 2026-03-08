@@ -278,3 +278,287 @@ BEGIN
     RETURN assigned_offset;
 END;
 $$ LANGUAGE plpgsql;
+
+-- ============================================================================
+-- Consumer Group Coordination Tables and Functions
+-- ============================================================================
+
+-- Consumer group membership tracking
+CREATE TABLE postka_consumer_group_members (
+    group_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,  -- UUID per consumer instance
+    topic_name TEXT NOT NULL REFERENCES postka_topics(topic_name),
+    joined_at TIMESTAMP WITH TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    last_heartbeat TIMESTAMP WITH TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    PRIMARY KEY (group_id, member_id, topic_name)
+);
+
+-- Partition assignments for consumer groups
+CREATE TABLE postka_partition_assignments (
+    group_id TEXT NOT NULL,
+    topic_name TEXT NOT NULL REFERENCES postka_topics(topic_name),
+    partition_id INTEGER NOT NULL,
+    member_id TEXT NOT NULL,
+    assigned_at TIMESTAMP WITH TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    PRIMARY KEY (group_id, topic_name, partition_id)
+);
+
+-- Consumer group generation tracking (incremented on each rebalance)
+CREATE TABLE postka_group_generation (
+    group_id TEXT NOT NULL,
+    topic_name TEXT NOT NULL REFERENCES postka_topics(topic_name),
+    generation_id INTEGER NOT NULL DEFAULT 0,
+    last_rebalance TIMESTAMP WITH TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    PRIMARY KEY (group_id, topic_name)
+);
+
+-- Composite type for partition assignment result
+CREATE TYPE postka_join_result AS (
+    generation_id INTEGER,
+    rebalance_triggered BOOLEAN,
+    assigned_partitions INTEGER[]
+);
+
+-- Function to assign partitions using range assignment strategy
+-- Sorts members alphabetically, distributes partitions evenly
+CREATE OR REPLACE FUNCTION postka_assign_partitions(p_group_id TEXT, p_topic TEXT)
+RETURNS VOID AS $$
+DECLARE
+    partition_count INTEGER;
+    member_ids TEXT[];
+    member_count INTEGER;
+    partitions_per_member INTEGER;
+    extra_partitions INTEGER;
+    current_partition INTEGER := 0;
+    partitions_for_this_member INTEGER;
+    member TEXT;
+    i INTEGER;
+BEGIN
+    -- Get partition count for the topic
+    SELECT t.partition_count INTO partition_count
+    FROM postka_topics t
+    WHERE t.topic_name = p_topic;
+
+    IF partition_count IS NULL THEN
+        RETURN;
+    END IF;
+
+    -- Get sorted list of member IDs
+    SELECT array_agg(m.member_id ORDER BY m.member_id)
+    INTO member_ids
+    FROM postka_consumer_group_members m
+    WHERE m.group_id = p_group_id AND m.topic_name = p_topic;
+
+    IF member_ids IS NULL OR array_length(member_ids, 1) IS NULL THEN
+        -- No members, clear all assignments
+        DELETE FROM postka_partition_assignments
+        WHERE group_id = p_group_id AND topic_name = p_topic;
+        RETURN;
+    END IF;
+
+    member_count := array_length(member_ids, 1);
+    partitions_per_member := partition_count / member_count;
+    extra_partitions := partition_count % member_count;
+
+    -- Clear existing assignments
+    DELETE FROM postka_partition_assignments
+    WHERE group_id = p_group_id AND topic_name = p_topic;
+
+    -- Assign partitions using range assignment
+    FOREACH member IN ARRAY member_ids LOOP
+        -- First 'extra_partitions' members get one extra partition
+        IF extra_partitions > 0 THEN
+            partitions_for_this_member := partitions_per_member + 1;
+            extra_partitions := extra_partitions - 1;
+        ELSE
+            partitions_for_this_member := partitions_per_member;
+        END IF;
+
+        -- Assign consecutive partitions to this member
+        FOR i IN 0..(partitions_for_this_member - 1) LOOP
+            INSERT INTO postka_partition_assignments (group_id, topic_name, partition_id, member_id)
+            VALUES (p_group_id, p_topic, current_partition, member);
+            current_partition := current_partition + 1;
+        END LOOP;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function for a consumer to join or heartbeat to a group
+-- Uses advisory lock for coordination
+-- Returns generation_id, whether rebalance was triggered, and assigned partitions
+CREATE OR REPLACE FUNCTION postka_join_group(
+    p_group_id TEXT,
+    p_member_id TEXT,
+    p_topic TEXT,
+    p_session_timeout_ms INTEGER DEFAULT 10000
+)
+RETURNS postka_join_result AS $$
+DECLARE
+    lock_id BIGINT;
+    membership_changed BOOLEAN := FALSE;
+    current_gen INTEGER;
+    result postka_join_result;
+    stale_cutoff TIMESTAMP WITH TIME ZONE;
+    deleted_count INTEGER;
+    existing_member BOOLEAN;
+BEGIN
+    -- Ensure the topic exists (auto-create with 1 partition if not)
+    PERFORM postka_ensure_topic(p_topic, 1);
+
+    -- Compute lock ID from group_id and topic
+    lock_id := hashtext(p_group_id || '::' || p_topic);
+
+    -- Acquire advisory lock for this group/topic combination
+    PERFORM pg_advisory_lock(lock_id);
+
+    BEGIN
+        -- Calculate stale cutoff time
+        stale_cutoff := (NOW() AT TIME ZONE 'UTC') - (p_session_timeout_ms || ' milliseconds')::interval;
+
+        -- Check if this member already exists
+        SELECT EXISTS(
+            SELECT 1 FROM postka_consumer_group_members
+            WHERE group_id = p_group_id AND member_id = p_member_id AND topic_name = p_topic
+        ) INTO existing_member;
+
+        -- Clean up stale members (except ourselves)
+        DELETE FROM postka_consumer_group_members
+        WHERE group_id = p_group_id
+          AND topic_name = p_topic
+          AND member_id != p_member_id
+          AND last_heartbeat < stale_cutoff;
+        GET DIAGNOSTICS deleted_count = ROW_COUNT;
+
+        IF deleted_count > 0 THEN
+            membership_changed := TRUE;
+        END IF;
+
+        -- Insert or update our membership
+        INSERT INTO postka_consumer_group_members (group_id, member_id, topic_name, joined_at, last_heartbeat)
+        VALUES (p_group_id, p_member_id, p_topic, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC')
+        ON CONFLICT (group_id, member_id, topic_name)
+        DO UPDATE SET last_heartbeat = NOW() AT TIME ZONE 'UTC';
+
+        -- If this is a new member joining, trigger rebalance
+        IF NOT existing_member THEN
+            membership_changed := TRUE;
+        END IF;
+
+        -- If membership changed, increment generation and reassign
+        IF membership_changed THEN
+            INSERT INTO postka_group_generation (group_id, topic_name, generation_id, last_rebalance)
+            VALUES (p_group_id, p_topic, 1, NOW() AT TIME ZONE 'UTC')
+            ON CONFLICT (group_id, topic_name)
+            DO UPDATE SET generation_id = postka_group_generation.generation_id + 1,
+                          last_rebalance = NOW() AT TIME ZONE 'UTC';
+
+            -- Reassign partitions
+            PERFORM postka_assign_partitions(p_group_id, p_topic);
+        END IF;
+
+        -- Get current generation
+        SELECT generation_id INTO current_gen
+        FROM postka_group_generation
+        WHERE group_id = p_group_id AND topic_name = p_topic;
+
+        IF current_gen IS NULL THEN
+            current_gen := 0;
+        END IF;
+
+        -- Get assigned partitions for this member
+        SELECT current_gen,
+               membership_changed,
+               COALESCE(array_agg(partition_id ORDER BY partition_id), ARRAY[]::INTEGER[])
+        INTO result
+        FROM postka_partition_assignments
+        WHERE group_id = p_group_id AND topic_name = p_topic AND member_id = p_member_id;
+
+        -- Release the lock
+        PERFORM pg_advisory_unlock(lock_id);
+
+        RETURN result;
+    EXCEPTION WHEN OTHERS THEN
+        -- Make sure to release lock on error
+        PERFORM pg_advisory_unlock(lock_id);
+        RAISE;
+    END;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function for a consumer to leave a group
+CREATE OR REPLACE FUNCTION postka_leave_group(
+    p_group_id TEXT,
+    p_member_id TEXT,
+    p_topic TEXT
+)
+RETURNS VOID AS $$
+DECLARE
+    lock_id BIGINT;
+BEGIN
+    -- Compute lock ID from group_id and topic
+    lock_id := hashtext(p_group_id || '::' || p_topic);
+
+    -- Acquire advisory lock for this group/topic combination
+    PERFORM pg_advisory_lock(lock_id);
+
+    BEGIN
+        -- Remove member from group
+        DELETE FROM postka_consumer_group_members
+        WHERE group_id = p_group_id AND member_id = p_member_id AND topic_name = p_topic;
+
+        -- Remove partition assignments for this member
+        DELETE FROM postka_partition_assignments
+        WHERE group_id = p_group_id AND member_id = p_member_id AND topic_name = p_topic;
+
+        -- Increment generation and reassign partitions
+        INSERT INTO postka_group_generation (group_id, topic_name, generation_id, last_rebalance)
+        VALUES (p_group_id, p_topic, 1, NOW() AT TIME ZONE 'UTC')
+        ON CONFLICT (group_id, topic_name)
+        DO UPDATE SET generation_id = postka_group_generation.generation_id + 1,
+                      last_rebalance = NOW() AT TIME ZONE 'UTC';
+
+        -- Reassign partitions among remaining members
+        PERFORM postka_assign_partitions(p_group_id, p_topic);
+
+        -- Release the lock
+        PERFORM pg_advisory_unlock(lock_id);
+    EXCEPTION WHEN OTHERS THEN
+        -- Make sure to release lock on error
+        PERFORM pg_advisory_unlock(lock_id);
+        RAISE;
+    END;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to get current generation and assigned partitions for a member
+CREATE OR REPLACE FUNCTION postka_get_assignment(
+    p_group_id TEXT,
+    p_member_id TEXT,
+    p_topic TEXT
+)
+RETURNS postka_join_result AS $$
+DECLARE
+    current_gen INTEGER;
+    result postka_join_result;
+BEGIN
+    -- Get current generation
+    SELECT generation_id INTO current_gen
+    FROM postka_group_generation
+    WHERE group_id = p_group_id AND topic_name = p_topic;
+
+    IF current_gen IS NULL THEN
+        current_gen := 0;
+    END IF;
+
+    -- Get assigned partitions for this member
+    SELECT current_gen,
+           FALSE,
+           COALESCE(array_agg(partition_id ORDER BY partition_id), ARRAY[]::INTEGER[])
+    INTO result
+    FROM postka_partition_assignments
+    WHERE group_id = p_group_id AND topic_name = p_topic AND member_id = p_member_id;
+
+    RETURN result;
+END;
+$$ LANGUAGE plpgsql;

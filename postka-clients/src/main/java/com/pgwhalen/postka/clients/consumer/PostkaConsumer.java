@@ -17,10 +17,16 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * A Postka client that consumes records from the PostgreSQL-backed message store.
@@ -39,6 +45,16 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
     private volatile boolean closed = false;
     private Connection connection;
     private PreparedStatement commitOffsetStatement;
+
+    // Consumer group coordination fields
+    private final String memberId = UUID.randomUUID().toString();
+    private final int heartbeatIntervalMs;
+    private final int sessionTimeoutMs;
+    private final Map<String, Integer> currentGenerationPerTopic = new ConcurrentHashMap<>();
+    private final Set<TopicPartition> assignedPartitions = ConcurrentHashMap.newKeySet();
+    private ConsumerRebalanceListener rebalanceListener = NoOpRebalanceListener.INSTANCE;
+    private ScheduledExecutorService heartbeatExecutor;
+    private ScheduledFuture<?> heartbeatFuture;
 
     /**
      * A consumer is instantiated by providing configuration properties.
@@ -61,6 +77,17 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
         this.keyDeserializer = keyDeserializer;
         this.valueDeserializer = valueDeserializer;
 
+        // Read heartbeat and session timeout configs
+        Object heartbeatConfig = configs.get(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG);
+        this.heartbeatIntervalMs = heartbeatConfig != null
+                ? Integer.parseInt(heartbeatConfig.toString())
+                : ConsumerConfig.DEFAULT_HEARTBEAT_INTERVAL_MS;
+
+        Object sessionConfig = configs.get(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG);
+        this.sessionTimeoutMs = sessionConfig != null
+                ? Integer.parseInt(sessionConfig.toString())
+                : ConsumerConfig.DEFAULT_SESSION_TIMEOUT_MS;
+
         if (this.keyDeserializer != null) {
             this.keyDeserializer.configure(configs, true);
         }
@@ -75,9 +102,26 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
      * @param topics The list of topics to subscribe to
      */
     public void subscribe(Collection<String> topics) {
+        subscribe(topics, NoOpRebalanceListener.INSTANCE);
+    }
+
+    /**
+     * Subscribe to the given list of topics to get dynamically assigned partitions.
+     *
+     * @param topics   The list of topics to subscribe to
+     * @param listener Non-null listener instance to get notifications on partition assignment/revocation
+     */
+    public void subscribe(Collection<String> topics, ConsumerRebalanceListener listener) {
+        if (listener == null) {
+            throw new IllegalArgumentException("RebalanceListener cannot be null");
+        }
+        this.rebalanceListener = listener;
         subscribedTopics.clear();
         subscribedTopics.addAll(topics);
         positions.clear();
+        assignedPartitions.clear();
+        currentGenerationPerTopic.clear();
+
         // Acquire connection for polling
         try {
             closeConnection();
@@ -85,7 +129,14 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
         } catch (SQLException e) {
             throw new RuntimeException("Failed to acquire connection", e);
         }
-        // Load committed offsets for subscribed topics
+
+        // If we have a group ID, join the consumer group and get partition assignments
+        if (groupId != null) {
+            joinConsumerGroup();
+            startHeartbeat();
+        }
+
+        // Load committed offsets for assigned partitions
         loadCommittedOffsets();
     }
 
@@ -100,8 +151,13 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
      * Unsubscribe from topics currently subscribed with subscribe.
      */
     public void unsubscribe() {
+        stopHeartbeat();
+        leaveConsumerGroup();
         subscribedTopics.clear();
         positions.clear();
+        assignedPartitions.clear();
+        currentGenerationPerTopic.clear();
+        rebalanceListener = NoOpRebalanceListener.INSTANCE;
         closeConnection();
     }
 
@@ -121,13 +177,260 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
                     try (ResultSet rs = ps.executeQuery()) {
                         while (rs.next()) {
                             TopicPartition tp = new TopicPartition(topic, rs.getInt(1));
-                            positions.put(tp, rs.getLong(2) + 1); // Start after committed
+                            // Only load offsets for partitions we're assigned to
+                            if (assignedPartitions.isEmpty() || assignedPartitions.contains(tp)) {
+                                positions.put(tp, rs.getLong(2) + 1); // Start after committed
+                            }
                         }
                     }
                 }
             }
         } catch (SQLException e) {
             throw new RuntimeException("Failed to load committed offsets", e);
+        }
+    }
+
+    /**
+     * Join the consumer group and get initial partition assignments.
+     */
+    private void joinConsumerGroup() {
+        if (groupId == null || connection == null) return;
+
+        try {
+            for (String topic : subscribedTopics) {
+                JoinResult result = callJoinGroup(topic);
+                handleRebalance(topic, result.assignedPartitions, result.generationId);
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to join consumer group", e);
+        }
+    }
+
+    private JoinResult callJoinGroup(String topic) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT * FROM postka_join_group(?, ?, ?, ?)")) {
+            ps.setString(1, groupId);
+            ps.setString(2, memberId);
+            ps.setString(3, topic);
+            ps.setInt(4, sessionTimeoutMs);
+
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    int generationId = rs.getInt(1);
+                    boolean rebalanceTriggered = rs.getBoolean(2);
+                    Array partitionsArray = rs.getArray(3);
+                    Set<Integer> partitions = new HashSet<>();
+                    if (partitionsArray != null) {
+                        Integer[] arr = (Integer[]) partitionsArray.getArray();
+                        for (Integer p : arr) {
+                            partitions.add(p);
+                        }
+                    }
+                    return new JoinResult(generationId, rebalanceTriggered, partitions);
+                }
+                return new JoinResult(0, false, Set.of());
+            }
+        }
+    }
+
+    private record JoinResult(int generationId, boolean rebalanceTriggered, Set<Integer> assignedPartitions) {}
+
+    /**
+     * Handle a rebalance event for a specific topic.
+     */
+    private void handleRebalance(String topic, Set<Integer> newPartitions, int newGeneration) {
+        // Skip if no generation change for this topic and we already have assignments for it
+        Integer currentGen = currentGenerationPerTopic.get(topic);
+        boolean hasAssignmentsForTopic = assignedPartitions.stream()
+                .anyMatch(tp -> tp.topic().equals(topic));
+        if (currentGen != null && currentGen == newGeneration && hasAssignmentsForTopic) {
+            return;
+        }
+
+        // Compute the old partitions for this topic
+        Set<TopicPartition> oldPartitionsForTopic = new HashSet<>();
+        for (TopicPartition tp : assignedPartitions) {
+            if (tp.topic().equals(topic)) {
+                oldPartitionsForTopic.add(tp);
+            }
+        }
+
+        // Convert new partition IDs to TopicPartition objects
+        Set<TopicPartition> newPartitionsSet = new HashSet<>();
+        for (Integer partition : newPartitions) {
+            newPartitionsSet.add(new TopicPartition(topic, partition));
+        }
+
+        // Compute revoked and assigned partitions
+        Set<TopicPartition> revokedPartitions = new HashSet<>(oldPartitionsForTopic);
+        revokedPartitions.removeAll(newPartitionsSet);
+
+        Set<TopicPartition> newlyAssignedPartitions = new HashSet<>(newPartitionsSet);
+        newlyAssignedPartitions.removeAll(oldPartitionsForTopic);
+
+        // Call onPartitionsRevoked for revoked partitions
+        if (!revokedPartitions.isEmpty()) {
+            rebalanceListener.onPartitionsRevoked(revokedPartitions);
+            // Remove positions for revoked partitions
+            for (TopicPartition tp : revokedPartitions) {
+                positions.remove(tp);
+            }
+        }
+
+        // Update assigned partitions
+        assignedPartitions.removeAll(oldPartitionsForTopic);
+        assignedPartitions.addAll(newPartitionsSet);
+
+        // Call onPartitionsAssigned for newly assigned partitions
+        if (!newlyAssignedPartitions.isEmpty()) {
+            rebalanceListener.onPartitionsAssigned(newlyAssignedPartitions);
+            // Load committed offsets for newly assigned partitions
+            loadCommittedOffsetsForPartitions(newlyAssignedPartitions);
+        }
+
+        // Update generation for this topic
+        currentGenerationPerTopic.put(topic, newGeneration);
+    }
+
+    private void loadCommittedOffsetsForPartitions(Set<TopicPartition> partitions) {
+        if (groupId == null || connection == null || partitions.isEmpty()) return;
+
+        try {
+            for (TopicPartition tp : partitions) {
+                try (PreparedStatement ps = connection.prepareStatement(
+                        """
+                        SELECT committed_offset
+                        FROM postka_consumer_offsets
+                        WHERE group_id = ? AND topic_name = ? AND partition_id = ?
+                        """)) {
+                    ps.setString(1, groupId);
+                    ps.setString(2, tp.topic());
+                    ps.setInt(3, tp.partition());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            positions.put(tp, rs.getLong(1) + 1); // Start after committed
+                        } else {
+                            positions.put(tp, 0L); // No committed offset, start from beginning
+                        }
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to load committed offsets", e);
+        }
+    }
+
+    /**
+     * Start the heartbeat executor.
+     */
+    private void startHeartbeat() {
+        if (heartbeatExecutor == null) {
+            heartbeatExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "postka-heartbeat-" + memberId.substring(0, 8));
+                t.setDaemon(true);
+                return t;
+            });
+        }
+        heartbeatFuture = heartbeatExecutor.scheduleAtFixedRate(
+                this::sendHeartbeat,
+                heartbeatIntervalMs,
+                heartbeatIntervalMs,
+                TimeUnit.MILLISECONDS
+        );
+    }
+
+    /**
+     * Stop the heartbeat executor.
+     */
+    private void stopHeartbeat() {
+        if (heartbeatFuture != null) {
+            heartbeatFuture.cancel(false);
+            heartbeatFuture = null;
+        }
+        if (heartbeatExecutor != null) {
+            heartbeatExecutor.shutdownNow();
+            heartbeatExecutor = null;
+        }
+    }
+
+    /**
+     * Send a heartbeat to the coordinator and check for rebalance.
+     */
+    private void sendHeartbeat() {
+        if (closed || connection == null || groupId == null) return;
+
+        try {
+            for (String topic : subscribedTopics) {
+                JoinResult result = callJoinGroup(topic);
+                // If generation changed, we need to handle rebalance
+                Integer currentGen = currentGenerationPerTopic.get(topic);
+                if (currentGen == null || result.generationId != currentGen) {
+                    handleRebalance(topic, result.assignedPartitions, result.generationId);
+                }
+            }
+        } catch (SQLException e) {
+            // Log error but don't throw - heartbeat failures are recoverable
+            // In production, we might want to trigger a rejoin
+        }
+    }
+
+    /**
+     * Check for rebalance at the start of poll.
+     */
+    private void checkForRebalance() {
+        if (groupId == null || connection == null) return;
+
+        try {
+            for (String topic : subscribedTopics) {
+                // Query current assignment without triggering join
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "SELECT * FROM postka_get_assignment(?, ?, ?)")) {
+                    ps.setString(1, groupId);
+                    ps.setString(2, memberId);
+                    ps.setString(3, topic);
+
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            int generationId = rs.getInt(1);
+                            Array partitionsArray = rs.getArray(3);
+                            Set<Integer> partitions = new HashSet<>();
+                            if (partitionsArray != null) {
+                                Integer[] arr = (Integer[]) partitionsArray.getArray();
+                                for (Integer p : arr) {
+                                    partitions.add(p);
+                                }
+                            }
+                            Integer currentGen = currentGenerationPerTopic.get(topic);
+                            if (currentGen == null || generationId != currentGen) {
+                                handleRebalance(topic, partitions, generationId);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to check for rebalance", e);
+        }
+    }
+
+    /**
+     * Leave the consumer group.
+     */
+    private void leaveConsumerGroup() {
+        if (groupId == null || connection == null) return;
+
+        try {
+            for (String topic : subscribedTopics) {
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "SELECT postka_leave_group(?, ?, ?)")) {
+                    ps.setString(1, groupId);
+                    ps.setString(2, memberId);
+                    ps.setString(3, topic);
+                    ps.execute();
+                }
+            }
+        } catch (SQLException e) {
+            // Ignore errors during leave - we're closing anyway
         }
     }
 
@@ -147,6 +450,9 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
             return ConsumerRecords.empty();
         }
 
+        // Check for rebalance at start of poll
+        checkForRebalance();
+
         long timeoutMillis = timeout.toMillis();
         long deadline = System.currentTimeMillis() + timeoutMillis;
         long pollIntervalMillis = 100; // Poll the database every 100ms
@@ -157,10 +463,25 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
             try {
                 for (String topic : subscribedTopics) {
                     // Build partition offset map from current positions for this topic
+                    // Only include partitions we're assigned to (when using consumer groups)
                     Map<Integer, Long> partitionOffsets = new HashMap<>();
                     for (Map.Entry<TopicPartition, Long> entry : positions.entrySet()) {
                         if (entry.getKey().topic().equals(topic)) {
-                            partitionOffsets.put(entry.getKey().partition(), entry.getValue());
+                            // If we have assigned partitions, only fetch from those
+                            if (assignedPartitions.isEmpty() || assignedPartitions.contains(entry.getKey())) {
+                                partitionOffsets.put(entry.getKey().partition(), entry.getValue());
+                            }
+                        }
+                    }
+
+                    // If using consumer groups and no partitions assigned, skip this topic
+                    if (groupId != null && !assignedPartitions.isEmpty()) {
+                        // Build partition offsets only for assigned partitions
+                        partitionOffsets.clear();
+                        for (TopicPartition tp : assignedPartitions) {
+                            if (tp.topic().equals(topic)) {
+                                partitionOffsets.put(tp.partition(), positions.getOrDefault(tp, 0L));
+                            }
                         }
                     }
 
@@ -173,9 +494,12 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
                         TopicPartition tp = entry.getKey();
                         List<ConsumerRecord<K, V>> records = entry.getValue();
                         if (!records.isEmpty()) {
-                            result.put(tp, records);
-                            long lastOffset = records.getLast().offset();
-                            positions.put(tp, lastOffset + 1);
+                            // Only include records from assigned partitions when using consumer groups
+                            if (assignedPartitions.isEmpty() || assignedPartitions.contains(tp)) {
+                                result.put(tp, records);
+                                long lastOffset = records.getLast().offset();
+                                positions.put(tp, lastOffset + 1);
+                            }
                         }
                     }
                 }
@@ -420,6 +744,15 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
     }
 
     /**
+     * Get the set of partitions currently assigned to this consumer.
+     *
+     * @return The set of partitions currently assigned to this consumer
+     */
+    public Set<TopicPartition> assignment() {
+        return Set.copyOf(assignedPartitions);
+    }
+
+    /**
      * Close the consumer.
      */
     @Override
@@ -434,6 +767,8 @@ public class PostkaConsumer<K, V> implements AutoCloseable {
      */
     public void close(Duration timeout) {
         closed = true;
+        stopHeartbeat();
+        leaveConsumerGroup();
         closeConnection();
     }
 
