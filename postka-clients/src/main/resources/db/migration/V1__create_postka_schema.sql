@@ -19,7 +19,7 @@ CREATE TABLE postka_topics (
     topic_name TEXT PRIMARY KEY,
     partition_count INTEGER NOT NULL DEFAULT 1,
     records_table_name TEXT NOT NULL UNIQUE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC')
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Consumer group offset tracking
@@ -29,7 +29,7 @@ CREATE TABLE postka_consumer_offsets (
     partition_id INTEGER NOT NULL,
     committed_offset BIGINT NOT NULL,
     metadata TEXT,
-    committed_at TIMESTAMP WITH TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    committed_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (group_id, topic_name, partition_id)
 );
 
@@ -58,7 +58,7 @@ RETURNS VOID AS $$
 BEGIN
     EXECUTE format('
         CREATE TABLE %I (
-            id BIGSERIAL,
+            id BIGINT GENERATED ALWAYS AS IDENTITY,
             partition_id INTEGER NOT NULL,
             offset_id BIGINT NOT NULL,
             record_timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -66,7 +66,7 @@ BEGIN
             key_bytes BYTEA,
             value_bytes BYTEA,
             headers postka_header[] DEFAULT ARRAY[]::postka_header[],
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT (NOW() AT TIME ZONE ''UTC''),
+            created_at TIMESTAMPTZ DEFAULT NOW(),
             PRIMARY KEY (partition_id, offset_id)
         ) PARTITION BY RANGE (partition_id)', p_table_name);
 
@@ -184,20 +184,13 @@ CREATE TYPE postka_partition_offset AS (
     start_offset BIGINT
 );
 
--- Table function to fetch records for a topic given partition/offset pairs
--- Returns records starting at each specified offset for each partition
-CREATE OR REPLACE FUNCTION postka_fetch_records(
+-- Helper function to build the fetch records SQL for a topic given partition/offset pairs.
+-- Used by postka_fetch_records (to execute) and postka_explain_fetch_records (to EXPLAIN).
+-- Returns NULL if the topic does not exist or no partitions are requested.
+CREATE OR REPLACE FUNCTION postka_build_fetch_sql(
     p_topic TEXT,
     p_partition_offsets postka_partition_offset[]
-)
-RETURNS TABLE (
-    partition_id INTEGER,
-    offset_id BIGINT,
-    record_timestamp TIMESTAMP WITH TIME ZONE,
-    key_bytes BYTEA,
-    value_bytes BYTEA,
-    headers postka_header[]
-) AS $$
+) RETURNS TEXT AS $$
 DECLARE
     table_name TEXT;
     partition_count INTEGER;
@@ -213,7 +206,7 @@ BEGIN
     WHERE t.topic_name = p_topic;
 
     IF table_name IS NULL THEN
-        RETURN;
+        RETURN NULL;
     END IF;
 
     -- If no partition offsets provided, use all partitions starting at offset 0
@@ -232,18 +225,61 @@ BEGIN
     END LOOP;
 
     IF array_length(where_clauses, 1) IS NULL THEN
-        RETURN;
+        RETURN NULL;
     END IF;
 
     where_clause := array_to_string(where_clauses, ' OR ');
 
-    -- Execute dynamic query and return results
-    RETURN QUERY EXECUTE format(
+    RETURN format(
         'SELECT r.partition_id, r.offset_id, r.record_timestamp, r.key_bytes, r.value_bytes, r.headers
          FROM %I r
          WHERE %s
          ORDER BY r.partition_id, r.offset_id',
         table_name, where_clause);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Table function to fetch records for a topic given partition/offset pairs
+-- Returns records starting at each specified offset for each partition
+CREATE OR REPLACE FUNCTION postka_fetch_records(
+    p_topic TEXT,
+    p_partition_offsets postka_partition_offset[]
+)
+RETURNS TABLE (
+    partition_id INTEGER,
+    offset_id BIGINT,
+    record_timestamp TIMESTAMP WITH TIME ZONE,
+    key_bytes BYTEA,
+    value_bytes BYTEA,
+    headers postka_header[]
+) AS $$
+DECLARE
+    fetch_sql TEXT;
+BEGIN
+    fetch_sql := postka_build_fetch_sql(p_topic, p_partition_offsets);
+    IF fetch_sql IS NULL THEN
+        RETURN;
+    END IF;
+    RETURN QUERY EXECUTE fetch_sql;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to EXPLAIN the query used by postka_fetch_records.
+-- Returns the EXPLAIN (FORMAT JSON) plan as TEXT.
+CREATE OR REPLACE FUNCTION postka_explain_fetch_records(
+    p_topic TEXT,
+    p_partition_offsets postka_partition_offset[]
+) RETURNS TEXT AS $$
+DECLARE
+    fetch_sql TEXT;
+    plan_json TEXT;
+BEGIN
+    fetch_sql := postka_build_fetch_sql(p_topic, p_partition_offsets);
+    IF fetch_sql IS NULL THEN
+        RETURN NULL;
+    END IF;
+    EXECUTE 'EXPLAIN (FORMAT JSON) ' || fetch_sql INTO plan_json;
+    RETURN plan_json;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -288,8 +324,8 @@ CREATE TABLE postka_consumer_group_members (
     group_id TEXT NOT NULL,
     member_id TEXT NOT NULL,  -- UUID per consumer instance
     topic_name TEXT NOT NULL REFERENCES postka_topics(topic_name),
-    joined_at TIMESTAMP WITH TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC'),
-    last_heartbeat TIMESTAMP WITH TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    joined_at TIMESTAMPTZ DEFAULT NOW(),
+    last_heartbeat TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (group_id, member_id, topic_name)
 );
 
@@ -299,7 +335,7 @@ CREATE TABLE postka_partition_assignments (
     topic_name TEXT NOT NULL REFERENCES postka_topics(topic_name),
     partition_id INTEGER NOT NULL,
     member_id TEXT NOT NULL,
-    assigned_at TIMESTAMP WITH TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    assigned_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (group_id, topic_name, partition_id)
 );
 
@@ -308,7 +344,7 @@ CREATE TABLE postka_group_generation (
     group_id TEXT NOT NULL,
     topic_name TEXT NOT NULL REFERENCES postka_topics(topic_name),
     generation_id INTEGER NOT NULL DEFAULT 0,
-    last_rebalance TIMESTAMP WITH TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    last_rebalance TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (group_id, topic_name)
 );
 
@@ -414,7 +450,7 @@ BEGIN
 
     BEGIN
         -- Calculate stale cutoff time
-        stale_cutoff := (NOW() AT TIME ZONE 'UTC') - (p_session_timeout_ms || ' milliseconds')::interval;
+        stale_cutoff := NOW() - (p_session_timeout_ms || ' milliseconds')::interval;
 
         -- Check if this member already exists
         SELECT EXISTS(
@@ -436,9 +472,9 @@ BEGIN
 
         -- Insert or update our membership
         INSERT INTO postka_consumer_group_members (group_id, member_id, topic_name, joined_at, last_heartbeat)
-        VALUES (p_group_id, p_member_id, p_topic, NOW() AT TIME ZONE 'UTC', NOW() AT TIME ZONE 'UTC')
+        VALUES (p_group_id, p_member_id, p_topic, NOW(), NOW())
         ON CONFLICT (group_id, member_id, topic_name)
-        DO UPDATE SET last_heartbeat = NOW() AT TIME ZONE 'UTC';
+        DO UPDATE SET last_heartbeat = NOW();
 
         -- If this is a new member joining, trigger rebalance
         IF NOT existing_member THEN
@@ -448,10 +484,10 @@ BEGIN
         -- If membership changed, increment generation and reassign
         IF membership_changed THEN
             INSERT INTO postka_group_generation (group_id, topic_name, generation_id, last_rebalance)
-            VALUES (p_group_id, p_topic, 1, NOW() AT TIME ZONE 'UTC')
+            VALUES (p_group_id, p_topic, 1, NOW())
             ON CONFLICT (group_id, topic_name)
             DO UPDATE SET generation_id = postka_group_generation.generation_id + 1,
-                          last_rebalance = NOW() AT TIME ZONE 'UTC';
+                          last_rebalance = NOW();
 
             -- Reassign partitions
             PERFORM postka_assign_partitions(p_group_id, p_topic);
@@ -513,10 +549,10 @@ BEGIN
 
         -- Increment generation and reassign partitions
         INSERT INTO postka_group_generation (group_id, topic_name, generation_id, last_rebalance)
-        VALUES (p_group_id, p_topic, 1, NOW() AT TIME ZONE 'UTC')
+        VALUES (p_group_id, p_topic, 1, NOW())
         ON CONFLICT (group_id, topic_name)
         DO UPDATE SET generation_id = postka_group_generation.generation_id + 1,
-                      last_rebalance = NOW() AT TIME ZONE 'UTC';
+                      last_rebalance = NOW();
 
         -- Reassign partitions among remaining members
         PERFORM postka_assign_partitions(p_group_id, p_topic);
